@@ -66,6 +66,7 @@ export class ZaloClient extends EventEmitter {
     this.api = null;
     this.selfProfile = null;
     this.selfUserId = null;
+    this.lastQrPath = null;
     this.heartbeatTimer = null;
     this.ThreadType = ThreadType;
   }
@@ -123,13 +124,16 @@ export class ZaloClient extends EventEmitter {
   async loginWithQr(zalo) {
     await fs.mkdir(path.dirname(this.credentialsFile), { recursive: true });
     const qrPath = path.join(path.dirname(this.credentialsFile), 'zalo-qr.png');
+    this.lastQrPath = qrPath;
     this.api = await zalo.loginQR({ qrPath }, async (event) => {
       if (event.type === LoginQRCallbackEventType.QRCodeGenerated) {
         await event.actions.saveToFile(qrPath);
+        this.emit('qr', { qrPath });
         this.logger.info({ qrPath }, 'Zalo QR generated. Open this file and scan it with Zalo mobile.');
       }
 
       if (event.type === LoginQRCallbackEventType.QRCodeScanned) {
+        this.emit('qrScanned', { account: event.data.display_name });
         this.logger.info({ account: event.data.display_name }, 'Zalo QR scanned. Confirm login on mobile.');
       }
 
@@ -147,6 +151,7 @@ export class ZaloClient extends EventEmitter {
           )}\n`,
           'utf8',
         );
+        this.emit('credentialsSaved', { credentialsFile: this.credentialsFile });
         this.logger.info({ credentialsFile: this.credentialsFile }, 'Zalo credentials saved.');
       }
     });

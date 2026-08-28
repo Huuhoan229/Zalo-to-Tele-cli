@@ -29,7 +29,41 @@ npm install
 npm start
 ```
 
-`npm start` runs the CLI bridge only.
+`npm start` runs the bridge and a small QR/status web page.
+
+Open:
+
+- `/` or `/qr-login` to scan the Zalo QR code when QR login is needed.
+- `/status` to view bridge status as JSON.
+- `/healthz` for a plain health check.
+
+If `WEB_ACCESS_TOKEN` is set, open `/?token=YOUR_TOKEN`.
+
+## Koyeb
+
+Deploy as a Web Service so the QR/status page is reachable from the Koyeb URL.
+
+Build command can stay empty. Run command:
+
+```bash
+npm start
+```
+
+Koyeb injects `PORT`, so `WEB_PORT` is optional there.
+
+Recommended env vars:
+
+```env
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_FORUM_CHAT_ID=-100...
+WEB_ACCESS_TOKEN=choose_a_private_token
+ZALO_LOGIN_MODE=auto
+ZALO_CREDENTIALS_FILE=/data/zalo/zalo-credentials.json
+DATA_FILE=/data/zalo/store.json
+DOWNLOAD_DIR=/data/zalo/downloads
+```
+
+Mount a persistent volume at `/data` if your Koyeb plan supports it. Without a volume, QR credentials and topic data can be lost on rebuild/restart.
 
 ## Files
 
@@ -41,4 +75,3 @@ npm start
 
 - `/id` shows chat/thread identifiers.
 - `/topics` lists mapped topics.
-

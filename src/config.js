@@ -30,10 +30,17 @@ function parseAllowedUsers(raw) {
   );
 }
 
+function parsePort(value, fallback) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 export const config = {
   rootDir,
   telegramBotToken: required('TELEGRAM_BOT_TOKEN'),
   telegramForumChatId: Number(required('TELEGRAM_FORUM_CHAT_ID')),
+  webPort: parsePort(process.env.PORT || process.env.WEB_PORT, 3000),
+  webAccessToken: process.env.WEB_ACCESS_TOKEN?.trim() || '',
   allowedTelegramUserIds: parseAllowedUsers(process.env.ALLOWED_TELEGRAM_USER_IDS),
   zaloCredentialsFile: optionalPath('ZALO_CREDENTIALS_FILE', 'sessions/zalo-credentials.json'),
   dataFile: optionalPath('DATA_FILE', 'data/store.json'),
