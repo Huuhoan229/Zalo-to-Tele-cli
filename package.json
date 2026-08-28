@@ -1,0 +1,30 @@
+{
+  "name": "zalo-to-tele",
+  "version": "0.1.0",
+  "description": "Telegram forum-topic bridge for a personal Zalo account.",
+  "type": "module",
+  "main": "src/cli.js",
+  "scripts": {
+    "start": "node src/cli.js",
+    "cli": "node src/cli.js",
+    "dev": "node --watch src/cli.js",
+    "telegram:id": "node src/telegramIdBot.js",
+    "check": "node --check src/index.js && node --check src/cli.js && node --check src/config.js && node --check src/store.js && node --check src/telegramBot.js && node --check src/zaloClient.js && node --check src/media.js && node --check src/telegramIdBot.js && node --check src/logger.js && node --check src/accounts.js && node --check src/bridgeController.js && node --check src/bridgeManager.js"
+  },
+  "keywords": [
+    "telegram",
+    "zalo",
+    "bridge",
+    "forum-topic"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "pino": "^9.6.0",
+    "pino-pretty": "^13.0.0",
+    "sharp": "^0.35.4",
+    "telegraf": "^4.16.3",
+    "zca-js": "^2.1.2"
+  }
+}
