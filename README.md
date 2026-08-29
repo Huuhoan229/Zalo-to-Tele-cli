@@ -4,6 +4,14 @@ Bridge a personal Zalo account to a Telegram forum group.
 
 > Uses `zca-js`, an unofficial Zalo Web API. It can break if Zalo changes behavior and may trigger session restrictions.
 
+## Quick Start
+
+1. Create a Telegram bot with `@BotFather` and copy the bot token.
+2. Create a Telegram forum group, then get its `chat_id` with `npm run telegram:id`.
+3. Copy `.env.example` to `.env` and fill `TELEGRAM_BOT_TOKEN` plus `TELEGRAM_FORUM_CHAT_ID`.
+4. Run `npm install` then `npm start`.
+5. Open the QR page, scan with Zalo mobile, and confirm login.
+
 ## Features
 
 - Zalo to Telegram forum-topic sync
