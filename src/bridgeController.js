@@ -29,6 +29,7 @@ export class BridgeController extends EventEmitter {
     this.healthTimer = null;
     this.lastActivityAt = Date.now();
     this.qrPath = null;
+    this.listenerConnected = false;
     this.ready = this.store.load();
   }
 
@@ -92,29 +93,44 @@ export class BridgeController extends EventEmitter {
         onTranscript: async (mapping, entry) => this.recordTranscript(mapping, entry),
       });
 
-      this.zalo.onMessage(async (message) => {
-        if (message.isSelf && this.consumePendingEcho(message.conversationId)) {
-          return;
-        }
-
-        await this.telegram.forwardZaloMessage(message);
+      this.zalo.on('connected', () => {
+        this.listenerConnected = true;
+        this.lastActivityAt = Date.now();
+        this.emitChange();
       });
 
       this.zalo.on('closed', ({ code, reason }) => {
+        this.listenerConnected = false;
         if (this.manualStop || this.suppressZaloClosed) return;
         this.scheduleRestart(`Zalo listener closed (${code || 'unknown'} ${reason || ''})`.trim());
       });
 
+      this.zalo.on('disconnected', ({ code, reason }) => {
+        this.listenerConnected = false;
+        if (this.manualStop) return;
+        this.scheduleRestart(`Zalo listener disconnected (${code || 'unknown'} ${reason || ''})`.trim());
+      });
+
       this.zalo.on('listenerError', (error) => {
+        this.listenerConnected = false;
         if (this.manualStop) return;
         this.lastError = error?.message || String(error);
         this.emitChange();
+        this.scheduleRestart(`Zalo listener error: ${this.lastError}`);
       });
 
       this.zalo.on('heartbeatError', (error) => {
         if (this.manualStop) return;
         this.lastError = error?.message || String(error);
         this.scheduleRestart(`Zalo heartbeat failed: ${this.lastError}`);
+      });
+
+      this.zalo.onMessage(async (message) => {
+        if (message.isSelf && this.consumePendingEcho(message.conversationId)) {
+          return;
+        }
+
+        await this.telegram.forwardZaloMessage(message);
       });
 
       await this.telegram.start();
@@ -318,6 +334,7 @@ export class BridgeController extends EventEmitter {
       startedAt: this.startedAt,
       lastError: this.lastError,
       qrPath: this.qrPath,
+      listenerConnected: this.listenerConnected,
       conversations: this.getConversationList(),
     };
   }

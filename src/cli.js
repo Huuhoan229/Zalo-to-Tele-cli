@@ -43,6 +43,7 @@ async function main() {
       status: controller.status,
       startedAt: controller.startedAt,
       lastError: controller.lastError,
+      listenerConnected: controller.listenerConnected,
       accountName: controller.zalo?.selfProfile?.displayName || controller.zalo?.selfProfile?.zaloName || account.label,
       webAccessProtected: Boolean(config.webAccessToken),
     }),
