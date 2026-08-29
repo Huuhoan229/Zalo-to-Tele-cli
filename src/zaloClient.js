@@ -4,6 +4,18 @@ import { EventEmitter } from 'node:events';
 import { LoginQRCallbackEventType, Zalo, ThreadType } from 'zca-js';
 import { imageMetadataGetter } from './media.js';
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRecoverableQrLoginError(error) {
+  const message = String(error?.message || error || '');
+  return (
+    error?.name === 'ZcaApiError' ||
+    /QR expired|cannot get scan result|cannot get confirm result|login qr/i.test(message)
+  );
+}
+
 function pickText(content) {
   if (typeof content === 'string') return content;
   if (!content || typeof content !== 'object') return '';
@@ -125,36 +137,65 @@ export class ZaloClient extends EventEmitter {
     await fs.mkdir(path.dirname(this.credentialsFile), { recursive: true });
     const qrPath = path.join(path.dirname(this.credentialsFile), 'zalo-qr.png');
     this.lastQrPath = qrPath;
-    this.api = await zalo.loginQR({ qrPath }, async (event) => {
-      if (event.type === LoginQRCallbackEventType.QRCodeGenerated) {
-        await event.actions.saveToFile(qrPath);
-        this.emit('qr', { qrPath });
-        this.logger.info({ qrPath }, 'Zalo QR generated. Open this file and scan it with Zalo mobile.');
-      }
+    while (true) {
+      try {
+        this.api = await zalo.loginQR({ qrPath }, async (event) => {
+          if (event.type === LoginQRCallbackEventType.QRCodeGenerated) {
+            if (this.manualStop) return;
+            await event.actions.saveToFile(qrPath);
+            this.emit('qr', { qrPath });
+            this.logger.info({ qrPath }, 'Zalo QR generated. Open this file and scan it with Zalo mobile.');
+          }
 
-      if (event.type === LoginQRCallbackEventType.QRCodeScanned) {
-        this.emit('qrScanned', { account: event.data.display_name });
-        this.logger.info({ account: event.data.display_name }, 'Zalo QR scanned. Confirm login on mobile.');
-      }
+          if (event.type === LoginQRCallbackEventType.QRCodeScanned) {
+            if (this.manualStop) return;
+            this.emit('qrScanned', { account: event.data.display_name });
+            this.logger.info({ account: event.data.display_name }, 'Zalo QR scanned. Confirm login on mobile.');
+          }
 
-      if (event.type === LoginQRCallbackEventType.GotLoginInfo) {
-        await fs.writeFile(
-          this.credentialsFile,
-          `${JSON.stringify(
-            {
-              cookie: event.data.cookie,
-              imei: event.data.imei,
-              userAgent: event.data.userAgent,
-            },
-            null,
-            2,
-          )}\n`,
-          'utf8',
-        );
-        this.emit('credentialsSaved', { credentialsFile: this.credentialsFile });
-        this.logger.info({ credentialsFile: this.credentialsFile }, 'Zalo credentials saved.');
+          if (event.type === LoginQRCallbackEventType.QRCodeExpired) {
+            if (this.manualStop) return;
+            await fs.rm(qrPath, { force: true });
+            this.emit('qrExpired', { qrPath });
+            this.logger.warn({ qrPath }, 'Zalo QR expired. Requesting a fresh QR code.');
+            event.actions.retry();
+          }
+
+          if (event.type === LoginQRCallbackEventType.QRCodeDeclined) {
+            if (this.manualStop) return;
+            await fs.rm(qrPath, { force: true });
+            this.emit('qrDeclined', { qrPath, code: event.data.code });
+            this.logger.warn({ qrPath }, 'Zalo QR declined. Requesting a fresh QR code.');
+            event.actions.retry();
+          }
+
+          if (event.type === LoginQRCallbackEventType.GotLoginInfo) {
+            if (this.manualStop) return;
+            await fs.writeFile(
+              this.credentialsFile,
+              `${JSON.stringify(
+                {
+                  cookie: event.data.cookie,
+                  imei: event.data.imei,
+                  userAgent: event.data.userAgent,
+                },
+                null,
+                2,
+              )}\n`,
+              'utf8',
+            );
+            this.emit('credentialsSaved', { credentialsFile: this.credentialsFile });
+            this.logger.info({ credentialsFile: this.credentialsFile }, 'Zalo credentials saved.');
+          }
+        });
+        return;
+      } catch (error) {
+        if (this.logger) this.logger.warn({ error }, 'Zalo QR login attempt failed.');
+        if (!isRecoverableQrLoginError(error)) throw error;
+        if (!this.lastQrPath) throw error;
+        await sleep(1000);
       }
-    });
+    }
   }
 
   onMessage(handler) {
