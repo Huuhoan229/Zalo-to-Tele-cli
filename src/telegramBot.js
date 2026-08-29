@@ -11,6 +11,11 @@ function isAllowed(config, userId) {
   return config.allowedTelegramUserIds.size === 0 || config.allowedTelegramUserIds.has(userId);
 }
 
+function isTelegramThreadNotFound(error) {
+  const description = String(error?.response?.description || error?.description || error?.message || '');
+  return error?.response?.error_code === 400 && /message thread not found/i.test(description);
+}
+
 function formatZaloMessage(zaloMessage) {
   const prefix = zaloMessage.isGroup ? `[${zaloMessage.senderName}]` : `[${zaloMessage.title}]`;
   const body = zaloMessage.text || zaloMessage.attachment?.title || '(non-text message)';
@@ -90,12 +95,17 @@ export class TelegramBridgeBot {
       return this.refreshTopicTitle(existing, zaloMessage);
     }
 
+    return this.createTopicMapping(zaloMessage);
+  }
+
+  async createTopicMapping(zaloMessage, previous = null) {
     const topic = await this.bot.telegram.createForumTopic(
       this.config.telegramForumChatId,
       topicName(zaloMessage.title),
     );
 
     return this.store.upsertMapping({
+      ...previous,
       conversationId: zaloMessage.conversationId,
       threadType: zaloMessage.threadType,
       topicId: topic.message_thread_id,
@@ -123,11 +133,35 @@ export class TelegramBridgeBot {
   }
 
   async forwardZaloMessage(zaloMessage) {
-    const mapping = await this.ensureTopicForZaloMessage(zaloMessage);
-    const options = { message_thread_id: mapping.topicId };
+    let mapping = await this.ensureTopicForZaloMessage(zaloMessage);
     const direction = zaloMessage.isSelf ? 'out' : 'in';
     const source = zaloMessage.isSelf ? 'zalo-self' : 'zalo';
     const senderName = zaloMessage.senderName;
+
+    try {
+      await this.sendZaloMessageToTelegram(mapping, zaloMessage);
+    } catch (error) {
+      if (!isTelegramThreadNotFound(error)) throw error;
+      this.logger.warn(
+        { error, topicId: mapping.topicId, conversationId: mapping.conversationId },
+        'Telegram topic is missing; recreating topic mapping.',
+      );
+      mapping = await this.createTopicMapping(zaloMessage, mapping);
+      await this.sendZaloMessageToTelegram(mapping, zaloMessage);
+    }
+
+    await this.onTranscript?.(mapping, {
+      direction,
+      source,
+      senderName,
+      text: zaloMessage.text,
+      attachment: zaloMessage.attachment,
+      threadType: zaloMessage.threadType,
+    });
+  }
+
+  async sendZaloMessageToTelegram(mapping, zaloMessage) {
+    const options = { message_thread_id: mapping.topicId };
 
     if (zaloMessage.attachment?.url) {
       try {
@@ -140,6 +174,7 @@ export class TelegramBridgeBot {
           },
         );
       } catch (error) {
+        if (isTelegramThreadNotFound(error)) throw error;
         this.logger.warn({ error }, 'Telegram could not fetch Zalo attachment URL; falling back to text.');
         await this.bot.telegram.sendMessage(
           this.config.telegramForumChatId,
@@ -147,14 +182,6 @@ export class TelegramBridgeBot {
           options,
         );
       }
-      await this.onTranscript?.(mapping, {
-        direction,
-        source,
-        senderName,
-        text: zaloMessage.text,
-        attachment: zaloMessage.attachment,
-        threadType: zaloMessage.threadType,
-      });
       return;
     }
 
@@ -163,14 +190,6 @@ export class TelegramBridgeBot {
       formatZaloMessage(zaloMessage),
       options,
     );
-    await this.onTranscript?.(mapping, {
-      direction,
-      source,
-      senderName,
-      text: zaloMessage.text,
-      attachment: zaloMessage.attachment,
-      threadType: zaloMessage.threadType,
-    });
   }
 
   async forwardTelegramText(ctx) {

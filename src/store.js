@@ -72,6 +72,11 @@ export class Store {
       updatedAt: new Date().toISOString(),
     };
 
+    const previous = this.state.conversations[normalized.conversationId];
+    if (previous && Number(previous.topicId) !== normalized.topicId) {
+      delete this.state.topics[String(previous.topicId)];
+    }
+
     this.state.conversations[normalized.conversationId] = normalized;
     this.state.topics[String(normalized.topicId)] = normalized;
     await this.save();
