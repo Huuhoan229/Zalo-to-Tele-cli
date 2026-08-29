@@ -64,6 +64,7 @@ DOWNLOAD_DIR=/data/zalo/downloads
 ```
 
 Mount a persistent volume at `/data` if your Koyeb plan supports it. Without a volume, QR credentials and topic data can be lost on rebuild/restart.
+Telegram media downloaded for forwarding is deleted after a successful handoff to Zalo, so `DOWNLOAD_DIR` only needs to cover in-flight files.
 
 ## Files
 

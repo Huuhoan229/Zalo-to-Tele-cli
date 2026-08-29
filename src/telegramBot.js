@@ -214,6 +214,7 @@ export class TelegramBridgeBot {
     const targetPath = await this.downloadTelegramFile(ctx, largestPhoto.file_id, largestPhoto.file_unique_id, 'jpg');
 
     this.pendingEcho?.register?.(mapping.conversationId);
+    let sent = false;
     try {
       await this.zalo.sendImage({
         conversationId: mapping.conversationId,
@@ -221,9 +222,14 @@ export class TelegramBridgeBot {
         filePath: targetPath,
         caption: ctx.message.caption,
       });
+      sent = true;
     } catch (error) {
       this.pendingEcho?.consume?.(mapping.conversationId);
       throw error;
+    } finally {
+      if (sent) {
+        await this.cleanupTelegramFile(targetPath);
+      }
     }
     await this.onTranscript?.(mapping, {
       direction: 'out',
@@ -231,8 +237,7 @@ export class TelegramBridgeBot {
       senderName: telegramSenderName(ctx),
       text: ctx.message.caption || '',
       attachment: {
-        url: targetPath,
-        title: ctx.message.document.file_name || 'image',
+        title: 'image',
       },
       threadType: mapping.threadType,
     });
@@ -256,6 +261,7 @@ export class TelegramBridgeBot {
     );
 
     this.pendingEcho?.register?.(mapping.conversationId);
+    let sent = false;
     try {
       await this.zalo.sendImage({
         conversationId: mapping.conversationId,
@@ -263,9 +269,14 @@ export class TelegramBridgeBot {
         filePath: targetPath,
         caption: ctx.message.caption,
       });
+      sent = true;
     } catch (error) {
       this.pendingEcho?.consume?.(mapping.conversationId);
       throw error;
+    } finally {
+      if (sent) {
+        await this.cleanupTelegramFile(targetPath);
+      }
     }
     await this.onTranscript?.(mapping, {
       direction: 'out',
@@ -273,7 +284,6 @@ export class TelegramBridgeBot {
       senderName: telegramSenderName(ctx),
       text: ctx.message.caption || '',
       attachment: {
-        url: targetPath,
         title: ctx.message.document.file_name || 'image',
       },
       threadType: mapping.threadType,
@@ -292,5 +302,14 @@ export class TelegramBridgeBot {
 
     await fs.writeFile(targetPath, Buffer.from(await response.arrayBuffer()));
     return targetPath;
+  }
+
+  async cleanupTelegramFile(filePath) {
+    if (!filePath) return;
+    try {
+      await fs.rm(filePath, { force: true });
+    } catch (error) {
+      this.logger.warn({ error, filePath }, 'Could not delete temporary Telegram file.');
+    }
   }
 }
