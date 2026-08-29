@@ -28,6 +28,7 @@ export class BridgeController extends EventEmitter {
     this.suppressZaloClosed = false;
     this.healthTimer = null;
     this.lastActivityAt = Date.now();
+    this.qrPath = null;
     this.ready = this.store.load();
   }
 
@@ -43,12 +44,29 @@ export class BridgeController extends EventEmitter {
     await this.ready;
 
     try {
-      this.zalo = await new ZaloClient({
+      this.zalo = new ZaloClient({
         credentialsFile: this.account.zaloCredentialsFile,
         loginMode: this.account.zaloLoginMode,
         selfListen: this.account.zaloSelfListen !== false,
         logger: this.logger.child({ scope: `${this.account.label}/zalo` }),
-      }).connect();
+      });
+
+      this.zalo.on('qr', ({ qrPath }) => {
+        this.qrPath = qrPath;
+        this.emit('qr', { qrPath });
+        this.emitChange();
+      });
+      this.zalo.on('qrScanned', ({ account }) => {
+        this.emit('qrScanned', { account });
+        this.emitChange();
+      });
+      this.zalo.on('credentialsSaved', ({ credentialsFile }) => {
+        this.qrPath = null;
+        this.emit('credentialsSaved', { credentialsFile });
+        this.emitChange();
+      });
+
+      await this.zalo.connect();
 
       this.telegram = new TelegramBridgeBot({
         config: {
@@ -299,6 +317,7 @@ export class BridgeController extends EventEmitter {
       status: this.status,
       startedAt: this.startedAt,
       lastError: this.lastError,
+      qrPath: this.qrPath,
       conversations: this.getConversationList(),
     };
   }
