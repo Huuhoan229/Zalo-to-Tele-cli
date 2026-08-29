@@ -158,7 +158,6 @@ export class ZaloClient extends EventEmitter {
             await fs.rm(qrPath, { force: true });
             this.emit('qrExpired', { qrPath });
             this.logger.warn({ qrPath }, 'Zalo QR expired. Requesting a fresh QR code.');
-            event.actions.retry();
           }
 
           if (event.type === LoginQRCallbackEventType.QRCodeDeclined) {
@@ -166,7 +165,6 @@ export class ZaloClient extends EventEmitter {
             await fs.rm(qrPath, { force: true });
             this.emit('qrDeclined', { qrPath, code: event.data.code });
             this.logger.warn({ qrPath }, 'Zalo QR declined. Requesting a fresh QR code.');
-            event.actions.retry();
           }
 
           if (event.type === LoginQRCallbackEventType.GotLoginInfo) {
