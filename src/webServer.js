@@ -36,7 +36,11 @@ function withToken(pathname, accessToken) {
 }
 
 function renderPage(status, accessToken) {
-  const qrPath = status.qrAvailable ? withToken(`/qr?t=${Date.now()}`, accessToken) : '';
+  const qrPath = status.qrImageBase64
+    ? `data:image/png;base64,${status.qrImageBase64}`
+    : status.qrAvailable
+      ? withToken(`/qr?t=${Date.now()}`, accessToken)
+      : '';
   const statusPath = withToken('/status', accessToken);
   const statusJson = escapeHtml(JSON.stringify(status, null, 2));
 
@@ -110,10 +114,11 @@ export function startWebServer({ port, accessToken, getStatus, getQrPath, logger
         return;
       }
 
+      const currentStatus = getStatus?.() || {};
       const qrPath = getQrPath?.();
       const status = {
-        ...(getStatus?.() || {}),
-        qrAvailable: await fileExists(qrPath),
+        ...currentStatus,
+        qrAvailable: Boolean(currentStatus.qrImageBase64) || await fileExists(qrPath),
         qrFilename: qrPath ? path.basename(qrPath) : null,
       };
 

@@ -162,7 +162,11 @@ export class ZaloClient extends EventEmitter {
           if (event.type === LoginQRCallbackEventType.QRCodeGenerated) {
             if (this.manualStop) return;
             await event.actions.saveToFile(qrPath);
-            this.emit('qr', { qrPath });
+            this.emit('qr', {
+              qrPath,
+              qrImageBase64: event.data.image,
+              qrCode: event.data.code,
+            });
             this.logger.info({ qrPath }, 'Zalo QR generated. Open this file and scan it with Zalo mobile.');
           }
 

@@ -46,6 +46,7 @@ async function main() {
       status: controller.status,
       startedAt: controller.startedAt,
       lastError: controller.lastError,
+      qrImageBase64: controller.qrImageBase64,
       listenerConnected: controller.listenerConnected,
       accountName: controller.zalo?.selfProfile?.displayName || controller.zalo?.selfProfile?.zaloName || account.label,
       webAccessProtected: Boolean(config.webAccessToken),

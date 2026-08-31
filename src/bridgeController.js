@@ -34,6 +34,7 @@ export class BridgeController extends EventEmitter {
     this.healthTimer = null;
     this.lastActivityAt = Date.now();
     this.qrPath = null;
+    this.qrImageBase64 = null;
     this.listenerConnected = false;
     this.ready = this.store.load();
   }
@@ -58,8 +59,9 @@ export class BridgeController extends EventEmitter {
         logger: this.logger.child({ scope: `${this.account.label}/zalo` }),
       });
 
-      this.zalo.on('qr', ({ qrPath }) => {
+      this.zalo.on('qr', ({ qrPath, qrImageBase64 }) => {
         this.qrPath = qrPath;
+        this.qrImageBase64 = qrImageBase64 || null;
         this.emit('qr', { qrPath });
         this.emitChange();
       });
@@ -67,8 +69,14 @@ export class BridgeController extends EventEmitter {
         this.emit('qrScanned', { account });
         this.emitChange();
       });
+      this.zalo.on('qrExpired', () => {
+        this.qrPath = null;
+        this.qrImageBase64 = null;
+        this.emitChange();
+      });
       this.zalo.on('credentialsSaved', ({ credentialsFile }) => {
         this.qrPath = null;
+        this.qrImageBase64 = null;
         this.emit('credentialsSaved', { credentialsFile });
         this.emitChange();
       });
@@ -148,6 +156,7 @@ export class BridgeController extends EventEmitter {
     } catch (error) {
       this.status = 'error';
       this.lastError = error?.message || String(error);
+      this.qrImageBase64 = null;
       this.logger.error({ error }, 'Bridge failed to start');
       this.emitChange();
       throw error;
@@ -341,6 +350,7 @@ export class BridgeController extends EventEmitter {
       startedAt: this.startedAt,
       lastError: this.lastError,
       qrPath: this.qrPath,
+      qrImageBase64: this.qrImageBase64,
       listenerConnected: this.listenerConnected,
       conversations: this.getConversationList(),
     };
