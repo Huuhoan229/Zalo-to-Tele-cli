@@ -76,9 +76,14 @@ ZALO_CREDENTIALS_FILE=sessions/zalo-credentials.json
 MONGODB_URI=mongodb+srv://...
 MONGODB_DB_NAME=zalo-to-tele
 MONGODB_COLLECTION_NAME=bridge_state
+LOCAL_INGEST_URL=https://your-tunnel.example.com/ingest/zalo-message
+LOCAL_INGEST_TOKEN=choose_a_shared_secret
+LOCAL_INGEST_ZALO_TITLE=nhom 2
 ```
 
 With MongoDB enabled, Zalo credentials and topic mappings survive redeploys. If you do not set `MONGODB_URI`, the app falls back to the local `data/store.json` file.
+
+If `LOCAL_INGEST_URL` is set, every non-self Zalo message from the matched `LOCAL_INGEST_ZALO_TITLE` conversation is copied to the OCR worker. The normal Zalo-to-Telegram bridge keeps running even when the OCR worker is offline.
 
 ## Public repo notes
 

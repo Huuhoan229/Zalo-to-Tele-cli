@@ -48,6 +48,9 @@ export const config = {
   zaloCredentialsFile: optionalPath('ZALO_CREDENTIALS_FILE', 'sessions/zalo-credentials.json'),
   dataFile: optionalPath('DATA_FILE', 'data/store.json'),
   downloadDir: optionalPath('DOWNLOAD_DIR', 'downloads'),
+  localIngestUrl: process.env.LOCAL_INGEST_URL?.trim() || '',
+  localIngestToken: process.env.LOCAL_INGEST_TOKEN?.trim() || '',
+  localIngestZaloTitle: process.env.LOCAL_INGEST_ZALO_TITLE?.trim() || '',
   zaloLoginMode:
     process.env.ZALO_LOGIN_MODE?.trim() === 'qr' &&
     fs.existsSync(optionalPath('ZALO_CREDENTIALS_FILE', 'sessions/zalo-credentials.json'))

@@ -8,6 +8,16 @@ function cleanMessageText(text) {
   return String(text || '').trim();
 }
 
+function normalizeFilterText(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'D')
+    .trim()
+    .toLowerCase();
+}
+
 export class BridgeController extends EventEmitter {
   constructor(account, options = {}) {
     super();
@@ -145,6 +155,7 @@ export class BridgeController extends EventEmitter {
         }
 
         await this.telegram.forwardZaloMessage(message);
+        await this.relayToLocalIngest(message);
       });
 
       await this.telegram.start();
@@ -257,6 +268,50 @@ export class BridgeController extends EventEmitter {
     });
     this.emitChange();
     return stored;
+  }
+
+  shouldRelayToLocalIngest(message) {
+    if (!this.account.localIngestUrl || !message || message.isSelf) return false;
+    const titleFilter = normalizeFilterText(this.account.localIngestZaloTitle);
+    if (!titleFilter) return true;
+    return normalizeFilterText(message.title).includes(titleFilter);
+  }
+
+  async relayToLocalIngest(message) {
+    if (!this.shouldRelayToLocalIngest(message)) return;
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    try {
+      const response = await fetch(this.account.localIngestUrl, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(this.account.localIngestToken ? { 'x-relay-token': this.account.localIngestToken } : {}),
+        },
+        body: JSON.stringify({
+          ...message,
+          relayedAt: new Date().toISOString(),
+          accountId: this.account.id,
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        throw new Error(`Local ingest responded ${response.status}`);
+      }
+    } catch (error) {
+      this.logger.warn(
+        {
+          error,
+          localIngestUrl: this.account.localIngestUrl,
+          conversationId: message.conversationId,
+        },
+        'Could not relay Zalo message to local OCR worker.',
+      );
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   registerPendingEcho(conversationId) {

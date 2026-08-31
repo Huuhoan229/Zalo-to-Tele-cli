@@ -29,6 +29,9 @@ async function main() {
     zaloCredentialsFile: config.zaloCredentialsFile,
     dataFile: config.dataFile,
     downloadDir: config.downloadDir,
+    localIngestUrl: config.localIngestUrl,
+    localIngestToken: config.localIngestToken,
+    localIngestZaloTitle: config.localIngestZaloTitle,
     autoStart: true,
     enabled: true,
   };
