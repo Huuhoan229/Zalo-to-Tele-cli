@@ -69,9 +69,10 @@ function normalizeAttachment(content) {
 }
 
 export class ZaloClient extends EventEmitter {
-  constructor({ credentialsFile, loginMode, selfListen = true, logger }) {
+  constructor({ credentialsFile, sessionStore = null, loginMode, selfListen = true, logger }) {
     super();
     this.credentialsFile = credentialsFile;
+    this.sessionStore = sessionStore;
     this.loginMode = loginMode;
     this.selfListen = selfListen;
     this.logger = logger;
@@ -89,12 +90,30 @@ export class ZaloClient extends EventEmitter {
       selfListen: this.selfListen,
     });
 
+    if (this.sessionStore?.getCredentials) {
+      const storedCredentials = await this.sessionStore.getCredentials();
+      if (storedCredentials) {
+        try {
+          this.api = await zalo.login(storedCredentials);
+          this.logger.info('Logged into Zalo with Mongo-backed credentials.');
+        } catch (error) {
+          if (this.loginMode === 'cookie') throw error;
+          this.logger.warn({ error }, 'Mongo-backed Zalo credentials unavailable; falling back to file or QR login.');
+        }
+      }
+    }
+
     if (this.loginMode === 'cookie' || this.loginMode === 'auto') {
       try {
-        const raw = await fs.readFile(this.credentialsFile, 'utf8');
-        const credentials = JSON.parse(raw);
-        this.api = await zalo.login(credentials);
-        this.logger.info({ credentialsFile: this.credentialsFile }, 'Logged into Zalo with saved credentials.');
+        if (!this.api) {
+          const raw = await fs.readFile(this.credentialsFile, 'utf8');
+          const credentials = JSON.parse(raw);
+          this.api = await zalo.login(credentials);
+          if (this.sessionStore?.setCredentials) {
+            await this.sessionStore.setCredentials(credentials);
+          }
+          this.logger.info({ credentialsFile: this.credentialsFile }, 'Logged into Zalo with saved credentials.');
+        }
       } catch (error) {
         if (this.loginMode === 'cookie') throw error;
         this.logger.warn({ error }, 'Saved Zalo credentials unavailable; falling back to QR login.');
@@ -169,19 +188,20 @@ export class ZaloClient extends EventEmitter {
 
           if (event.type === LoginQRCallbackEventType.GotLoginInfo) {
             if (this.manualStop) return;
-            await fs.writeFile(
-              this.credentialsFile,
-              `${JSON.stringify(
-                {
-                  cookie: event.data.cookie,
-                  imei: event.data.imei,
-                  userAgent: event.data.userAgent,
-                },
-                null,
-                2,
-              )}\n`,
-              'utf8',
-            );
+            const credentials = {
+              cookie: event.data.cookie,
+              imei: event.data.imei,
+              userAgent: event.data.userAgent,
+            };
+            if (this.sessionStore?.setCredentials) {
+              await this.sessionStore.setCredentials(credentials);
+            } else {
+              await fs.writeFile(
+                this.credentialsFile,
+                `${JSON.stringify(credentials, null, 2)}\n`,
+                'utf8',
+              );
+            }
             this.emit('credentialsSaved', { credentialsFile: this.credentialsFile });
             this.logger.info({ credentialsFile: this.credentialsFile }, 'Zalo credentials saved.');
           }

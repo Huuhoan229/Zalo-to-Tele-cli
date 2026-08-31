@@ -16,7 +16,12 @@ export class BridgeController extends EventEmitter {
     this.onLog = options.onLog;
     this.onState = options.onState;
     this.logger = options.logger || createLogger({ scope: account.label, onLog: this.onLog });
-    this.store = new Store(account.dataFile);
+    this.store = new Store(account.dataFile, {
+      mongoUri: account.mongoUri,
+      mongoDbName: account.mongoDbName,
+      mongoCollectionName: account.mongoCollectionName,
+      accountId: account.id,
+    });
     this.zalo = null;
     this.telegram = null;
     this.status = 'idle';
@@ -47,6 +52,7 @@ export class BridgeController extends EventEmitter {
     try {
       this.zalo = new ZaloClient({
         credentialsFile: this.account.zaloCredentialsFile,
+        sessionStore: this.store,
         loginMode: this.account.zaloLoginMode,
         selfListen: this.account.zaloSelfListen !== false,
         logger: this.logger.child({ scope: `${this.account.label}/zalo` }),
@@ -158,6 +164,7 @@ export class BridgeController extends EventEmitter {
     } finally {
       this.status = 'stopped';
       this.emitChange();
+      await this.store.close();
     }
   }
 

@@ -21,6 +21,9 @@ async function main() {
     telegramBotToken: config.telegramBotToken,
     telegramForumChatId: config.telegramForumChatId,
     allowedTelegramUserIds: [...config.allowedTelegramUserIds].join(','),
+    mongoUri: config.mongoUri,
+    mongoDbName: config.mongoDbName,
+    mongoCollectionName: config.mongoCollectionName,
     zaloLoginMode: config.zaloLoginMode,
     zaloSelfListen: config.zaloSelfListen,
     zaloCredentialsFile: config.zaloCredentialsFile,
@@ -49,15 +52,15 @@ async function main() {
     }),
   });
 
-  function shutdown(reason) {
-    controller.stop(reason);
+  async function shutdown(reason) {
+    await controller.stop(reason);
     webServer.close();
   }
 
   await controller.start();
 
-  process.once('SIGINT', () => shutdown('SIGINT'));
-  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  process.once('SIGINT', () => void shutdown('SIGINT'));
+  process.once('SIGTERM', () => void shutdown('SIGTERM'));
 }
 
 main().catch((error) => {

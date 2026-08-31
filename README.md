@@ -28,6 +28,7 @@ Bridge a personal Zalo account to a Telegram forum group.
 ```env
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_FORUM_CHAT_ID=-100...
+MONGODB_URI=mongodb+srv://...
 ```
 
 3. Get the forum chat id:
@@ -71,11 +72,13 @@ TELEGRAM_FORUM_CHAT_ID=-100...
 WEB_ACCESS_TOKEN=choose_a_private_token
 ZALO_LOGIN_MODE=qr
 DOWNLOAD_DIR=downloads
-DATA_FILE=data/store.json
 ZALO_CREDENTIALS_FILE=sessions/zalo-credentials.json
+MONGODB_URI=mongodb+srv://...
+MONGODB_DB_NAME=zalo-to-tele
+MONGODB_COLLECTION_NAME=bridge_state
 ```
 
-If your plan supports volumes, mount one for persistent credentials and transcripts. On free instances, keep `DOWNLOAD_DIR` small because forwarded media is deleted after a successful handoff.
+With MongoDB enabled, Zalo credentials and topic mappings survive redeploys. If you do not set `MONGODB_URI`, the app falls back to the local `data/store.json` file.
 
 ## Public repo notes
 
