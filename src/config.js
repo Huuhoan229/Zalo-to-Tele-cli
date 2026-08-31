@@ -45,6 +45,7 @@ export const config = {
   mongoUri: process.env.MONGODB_URI?.trim() || '',
   mongoDbName: process.env.MONGODB_DB_NAME?.trim() || 'zalo-to-tele',
   mongoCollectionName: process.env.MONGODB_COLLECTION_NAME?.trim() || 'bridge_state',
+  ocrQueueCollectionName: process.env.MONGODB_QUEUE_COLLECTION_NAME?.trim() || 'ocr_queue',
   zaloCredentialsFile: optionalPath('ZALO_CREDENTIALS_FILE', 'sessions/zalo-credentials.json'),
   dataFile: optionalPath('DATA_FILE', 'data/store.json'),
   downloadDir: optionalPath('DOWNLOAD_DIR', 'downloads'),

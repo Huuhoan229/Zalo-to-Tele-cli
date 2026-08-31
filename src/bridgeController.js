@@ -154,6 +154,7 @@ export class BridgeController extends EventEmitter {
           return;
         }
 
+        await this.queueForOcr(message);
         await this.telegram.forwardZaloMessage(message);
         await this.relayToLocalIngest(message);
       });
@@ -268,6 +269,29 @@ export class BridgeController extends EventEmitter {
     });
     this.emitChange();
     return stored;
+  }
+
+  shouldQueueForOcr(message) {
+    if (!message || message.isSelf) return false;
+    const titleFilter = normalizeFilterText(this.account.localIngestZaloTitle);
+    if (!titleFilter) return true;
+    return normalizeFilterText(message.title).includes(titleFilter);
+  }
+
+  async queueForOcr(message) {
+    if (!this.shouldQueueForOcr(message)) return;
+
+    try {
+      await this.store.enqueueOcrMessage(message);
+    } catch (error) {
+      this.logger.warn(
+        {
+          error,
+          conversationId: message.conversationId,
+        },
+        'Could not enqueue Zalo message for OCR.',
+      );
+    }
   }
 
   shouldRelayToLocalIngest(message) {

@@ -24,6 +24,7 @@ async function main() {
     mongoUri: config.mongoUri,
     mongoDbName: config.mongoDbName,
     mongoCollectionName: config.mongoCollectionName,
+    ocrQueueCollectionName: config.ocrQueueCollectionName,
     zaloLoginMode: config.zaloLoginMode,
     zaloSelfListen: config.zaloSelfListen,
     zaloCredentialsFile: config.zaloCredentialsFile,

@@ -12,15 +12,26 @@ const EMPTY_STATE = {
 };
 
 export class Store {
-  constructor(filePath, { mongoUri = '', mongoDbName = 'zalo-to-tele', mongoCollectionName = 'bridge_state', accountId = 'primary' } = {}) {
+  constructor(
+    filePath,
+    {
+      mongoUri = '',
+      mongoDbName = 'zalo-to-tele',
+      mongoCollectionName = 'bridge_state',
+      ocrQueueCollectionName = 'ocr_queue',
+      accountId = 'primary',
+    } = {},
+  ) {
     this.filePath = filePath;
     this.mongoUri = mongoUri;
     this.mongoDbName = mongoDbName;
     this.mongoCollectionName = mongoCollectionName;
+    this.ocrQueueCollectionName = ocrQueueCollectionName;
     this.accountId = accountId;
     this.useMongo = Boolean(mongoUri);
     this.mongoClient = null;
     this.mongoCollection = null;
+    this.ocrQueueCollection = null;
     this.state = structuredClone(EMPTY_STATE);
     this.writeQueue = Promise.resolve();
   }
@@ -34,6 +45,16 @@ export class Store {
     await this.mongoClient.connect();
     this.mongoCollection = this.mongoClient.db(this.mongoDbName).collection(this.mongoCollectionName);
     return this.mongoCollection;
+  }
+
+  async ensureOcrQueueCollection() {
+    if (!this.useMongo) return null;
+    if (this.ocrQueueCollection) return this.ocrQueueCollection;
+    await this.ensureMongo();
+    this.ocrQueueCollection = this.mongoClient.db(this.mongoDbName).collection(this.ocrQueueCollectionName);
+    await this.ocrQueueCollection.createIndex({ status: 1, queuedAt: 1 });
+    await this.ocrQueueCollection.createIndex({ processedAt: 1 }, { expireAfterSeconds: 7 * 24 * 60 * 60 });
+    return this.ocrQueueCollection;
   }
 
   async load() {
@@ -107,6 +128,7 @@ export class Store {
     await this.mongoClient.close();
     this.mongoClient = null;
     this.mongoCollection = null;
+    this.ocrQueueCollection = null;
   }
 
   getByConversation(conversationId) {
@@ -190,5 +212,44 @@ export class Store {
 
     await this.save();
     return entry;
+  }
+
+  async enqueueOcrMessage(message) {
+    if (!this.useMongo) return null;
+    const collection = await this.ensureOcrQueueCollection();
+    const messageId = String(
+      message.id || message.messageId || `${message.conversationId || 'unknown'}-${message.createdAt || Date.now()}`,
+    );
+    const now = new Date().toISOString();
+    const doc = {
+      _id: `${this.accountId}:${messageId}`,
+      accountId: this.accountId,
+      messageId,
+      conversationId: String(message.conversationId || ''),
+      threadType: message.threadType ?? null,
+      title: message.title || '',
+      senderName: message.senderName || '',
+      text: message.text || '',
+      attachment: message.attachment || null,
+      isGroup: Boolean(message.isGroup),
+      isSelf: Boolean(message.isSelf),
+      status: 'pending',
+      payload: {
+        ...message,
+        id: messageId,
+        accountId: this.accountId,
+      },
+      queuedAt: now,
+      updatedAt: now,
+    };
+
+    await collection.updateOne(
+      { _id: doc._id },
+      {
+        $setOnInsert: doc,
+      },
+      { upsert: true },
+    );
+    return doc;
   }
 }
