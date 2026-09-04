@@ -227,11 +227,17 @@ export class TelegramBridgeBot {
 
   async forwardTelegramPhoto(ctx) {
     if (ctx.chat?.id !== this.config.telegramForumChatId) return;
-    if (!ctx.message.message_thread_id) return;
+    if (!ctx.message.message_thread_id) {
+      await ctx.reply('Ảnh này chưa nằm trong topic Zalo nào nên không biết gửi về đâu.');
+      return;
+    }
     if (!isAllowed(this.config, ctx.from.id)) return;
 
     const mapping = this.store.getByTopic(ctx.message.message_thread_id);
-    if (!mapping) return;
+    if (!mapping) {
+      await ctx.reply('Topic này chưa được map với cuộc trò chuyện Zalo nào.');
+      return;
+    }
 
     const largestPhoto = ctx.message.photo.at(-1);
     const targetPath = await this.downloadTelegramFile(ctx, largestPhoto.file_id, largestPhoto.file_unique_id, 'jpg');
@@ -277,12 +283,18 @@ export class TelegramBridgeBot {
 
   async forwardTelegramDocument(ctx) {
     if (ctx.chat?.id !== this.config.telegramForumChatId) return;
-    if (!ctx.message.message_thread_id) return;
+    if (!ctx.message.message_thread_id) {
+      await ctx.reply('Ảnh này chưa nằm trong topic Zalo nào nên không biết gửi về đâu.');
+      return;
+    }
     if (!isAllowed(this.config, ctx.from.id)) return;
     if (!ctx.message.document.mime_type?.startsWith('image/')) return;
 
     const mapping = this.store.getByTopic(ctx.message.message_thread_id);
-    if (!mapping) return;
+    if (!mapping) {
+      await ctx.reply('Topic này chưa được map với cuộc trò chuyện Zalo nào.');
+      return;
+    }
 
     const extension = ctx.message.document.file_name?.split('.').pop() || 'jpg';
     const targetPath = await this.downloadTelegramFile(
