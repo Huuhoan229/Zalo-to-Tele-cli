@@ -3,8 +3,11 @@ import { message } from 'telegraf/filters';
 import fs from 'node:fs/promises';
 import { ensureDir, uniqueDownloadPath } from './media.js';
 
-function topicName(title) {
-  return `Zalo - ${String(title || 'Unknown').slice(0, 110)}`;
+const runtimes = new Map();
+
+function topicName(title, accountLabel = '') {
+  const prefix = accountLabel ? `[${accountLabel}] ` : '';
+  return `${prefix}Zalo - ${String(title || 'Unknown')}`.slice(0, 128);
 }
 
 function isAllowed(config, userId) {
@@ -31,29 +34,52 @@ function humanError(error) {
   return String(error?.response?.description || error?.message || error || 'Unknown error').slice(0, 500);
 }
 
-export class TelegramBridgeBot {
-  constructor({ config, store, zalo, logger, pendingEcho, onTranscript }) {
+function runtimeKey(config) {
+  return `${config.telegramBotToken}:${config.telegramForumChatId}`;
+}
+
+class SharedTelegramRuntime {
+  constructor(config, logger) {
     this.config = config;
-    this.store = store;
-    this.zalo = zalo;
     this.logger = logger;
-    this.pendingEcho = pendingEcho || null;
-    this.onTranscript = onTranscript;
     this.bot = new Telegraf(config.telegramBotToken);
+    this.bridges = new Set();
+    this.handlersRegistered = false;
+    this.started = false;
+  }
+
+  addBridge(bridge) {
+    this.bridges.add(bridge);
+    this.registerHandlers();
+  }
+
+  removeBridge(bridge, reason = 'manual') {
+    this.bridges.delete(bridge);
+    if (this.bridges.size === 0 && this.started) {
+      this.bot.stop(reason);
+      this.started = false;
+    }
   }
 
   async start() {
-    await ensureDir(this.config.downloadDir);
-    this.registerHandlers();
+    if (this.started) return;
     await this.bot.launch();
+    this.started = true;
     this.logger.info('Telegram bot started');
   }
 
-  stop(reason) {
-    this.bot.stop(reason);
+  findBridgeByTopic(topicId) {
+    for (const bridge of this.bridges) {
+      const mapping = bridge.store.getByTopic(topicId);
+      if (mapping) return { bridge, mapping };
+    }
+    return null;
   }
 
   registerHandlers() {
+    if (this.handlersRegistered) return;
+    this.handlersRegistered = true;
+
     this.bot.command('id', async (ctx) => {
       await ctx.reply(
         [
@@ -65,32 +91,96 @@ export class TelegramBridgeBot {
     });
 
     this.bot.command('topics', async (ctx) => {
-      const mappings = this.store.listMappings();
+      const mappings = [...this.bridges].flatMap((bridge) =>
+        bridge.store.listMappings().map((item) => ({
+          account: bridge.config.accountLabel || bridge.config.accountId || 'Zalo',
+          ...item,
+        })),
+      );
       const text =
         mappings.length === 0
           ? 'Chưa có topic nào được map.'
           : mappings
-              .map((item) => `${item.topicId} -> ${item.title} (${item.conversationId})`)
+              .map((item) => `[${item.account}] ${item.topicId} -> ${item.title} (${item.conversationId})`)
               .join('\n');
       await ctx.reply(text);
     });
 
     this.bot.on(message('text'), async (ctx) => {
       if (ctx.message.text.startsWith('/')) return;
-      await this.forwardTelegramText(ctx);
+      await this.routeTelegramMessage(ctx, 'text');
     });
 
     this.bot.on(message('photo'), async (ctx) => {
-      await this.forwardTelegramPhoto(ctx);
+      await this.routeTelegramMessage(ctx, 'photo');
     });
 
     this.bot.on(message('document'), async (ctx) => {
-      await this.forwardTelegramDocument(ctx);
+      await this.routeTelegramMessage(ctx, 'document');
     });
 
     this.bot.catch((error, ctx) => {
       this.logger.error({ error, updateType: ctx.updateType }, 'Telegram handler failed');
     });
+  }
+
+  async routeTelegramMessage(ctx, type) {
+    if (ctx.chat?.id !== this.config.telegramForumChatId) return;
+    if (!ctx.message.message_thread_id) {
+      if (type !== 'text') {
+        await ctx.reply('Ảnh này chưa nằm trong topic Zalo nào nên không biết gửi về đâu.');
+      }
+      return;
+    }
+
+    const routed = this.findBridgeByTopic(ctx.message.message_thread_id);
+    if (!routed) {
+      if (type !== 'text') {
+        await ctx.reply('Topic này chưa được map với cuộc trò chuyện Zalo nào.');
+      }
+      return;
+    }
+
+    if (type === 'text') {
+      await routed.bridge.forwardTelegramText(ctx, routed.mapping);
+      return;
+    }
+    if (type === 'photo') {
+      await routed.bridge.forwardTelegramPhoto(ctx, routed.mapping);
+      return;
+    }
+    await routed.bridge.forwardTelegramDocument(ctx, routed.mapping);
+  }
+}
+
+function getRuntime(config, logger) {
+  const key = runtimeKey(config);
+  if (!runtimes.has(key)) {
+    runtimes.set(key, new SharedTelegramRuntime(config, logger));
+  }
+  return runtimes.get(key);
+}
+
+export class TelegramBridgeBot {
+  constructor({ config, store, zalo, logger, pendingEcho, onTranscript }) {
+    this.config = config;
+    this.store = store;
+    this.zalo = zalo;
+    this.logger = logger;
+    this.pendingEcho = pendingEcho || null;
+    this.onTranscript = onTranscript;
+    this.runtime = getRuntime(config, logger);
+    this.bot = this.runtime.bot;
+  }
+
+  async start() {
+    await ensureDir(this.config.downloadDir);
+    this.runtime.addBridge(this);
+    await this.runtime.start();
+  }
+
+  stop(reason) {
+    this.runtime.removeBridge(this, reason);
   }
 
   async ensureTopicForZaloMessage(zaloMessage) {
@@ -105,7 +195,7 @@ export class TelegramBridgeBot {
   async createTopicMapping(zaloMessage, previous = null) {
     const topic = await this.bot.telegram.createForumTopic(
       this.config.telegramForumChatId,
-      topicName(zaloMessage.title),
+      topicName(zaloMessage.title, this.config.accountLabel),
     );
 
     return this.store.upsertMapping({
@@ -123,7 +213,7 @@ export class TelegramBridgeBot {
 
     try {
       await this.bot.telegram.editForumTopic(this.config.telegramForumChatId, existing.topicId, {
-        name: topicName(nextTitle),
+        name: topicName(nextTitle, this.config.accountLabel),
       });
     } catch (error) {
       this.logger.warn({ error, topicId: existing.topicId }, 'Could not rename Telegram topic.');
@@ -196,12 +286,12 @@ export class TelegramBridgeBot {
     );
   }
 
-  async forwardTelegramText(ctx) {
+  async forwardTelegramText(ctx, mapped = null) {
     if (ctx.chat?.id !== this.config.telegramForumChatId) return;
     if (!ctx.message.message_thread_id) return;
     if (!isAllowed(this.config, ctx.from.id)) return;
 
-    const mapping = this.store.getByTopic(ctx.message.message_thread_id);
+    const mapping = mapped || this.store.getByTopic(ctx.message.message_thread_id);
     if (!mapping) return;
 
     this.pendingEcho?.register?.(mapping.conversationId);
@@ -225,7 +315,7 @@ export class TelegramBridgeBot {
     });
   }
 
-  async forwardTelegramPhoto(ctx) {
+  async forwardTelegramPhoto(ctx, mapped = null) {
     if (ctx.chat?.id !== this.config.telegramForumChatId) return;
     if (!ctx.message.message_thread_id) {
       await ctx.reply('Ảnh này chưa nằm trong topic Zalo nào nên không biết gửi về đâu.');
@@ -233,7 +323,7 @@ export class TelegramBridgeBot {
     }
     if (!isAllowed(this.config, ctx.from.id)) return;
 
-    const mapping = this.store.getByTopic(ctx.message.message_thread_id);
+    const mapping = mapped || this.store.getByTopic(ctx.message.message_thread_id);
     if (!mapping) {
       await ctx.reply('Topic này chưa được map với cuộc trò chuyện Zalo nào.');
       return;
@@ -281,7 +371,7 @@ export class TelegramBridgeBot {
     });
   }
 
-  async forwardTelegramDocument(ctx) {
+  async forwardTelegramDocument(ctx, mapped = null) {
     if (ctx.chat?.id !== this.config.telegramForumChatId) return;
     if (!ctx.message.message_thread_id) {
       await ctx.reply('Ảnh này chưa nằm trong topic Zalo nào nên không biết gửi về đâu.');
@@ -290,7 +380,7 @@ export class TelegramBridgeBot {
     if (!isAllowed(this.config, ctx.from.id)) return;
     if (!ctx.message.document.mime_type?.startsWith('image/')) return;
 
-    const mapping = this.store.getByTopic(ctx.message.message_thread_id);
+    const mapping = mapped || this.store.getByTopic(ctx.message.message_thread_id);
     if (!mapping) {
       await ctx.reply('Topic này chưa được map với cuộc trò chuyện Zalo nào.');
       return;

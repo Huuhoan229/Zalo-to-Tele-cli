@@ -30,6 +30,7 @@ export class BridgeController extends EventEmitter {
       mongoUri: account.mongoUri,
       mongoDbName: account.mongoDbName,
       mongoCollectionName: account.mongoCollectionName,
+      ocrQueueCollectionName: account.ocrQueueCollectionName,
       accountId: account.id,
     });
     this.zalo = null;
@@ -97,6 +98,8 @@ export class BridgeController extends EventEmitter {
         config: {
           telegramBotToken: this.account.telegramBotToken,
           telegramForumChatId: this.account.telegramForumChatId,
+          accountId: this.account.id,
+          accountLabel: this.account.label,
           allowedTelegramUserIds: new Set(
             String(this.account.allowedTelegramUserIds || '')
               .split(',')

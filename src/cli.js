@@ -1,6 +1,6 @@
 import pino from 'pino';
 import { config } from './config.js';
-import { BridgeController } from './bridgeController.js';
+import { BridgeManager } from './bridgeManager.js';
 import { startWebServer } from './webServer.js';
 
 const logger = pino({
@@ -15,54 +15,55 @@ const logger = pino({
 });
 
 async function main() {
-  const account = {
-    id: 'primary',
-    label: 'Primary',
-    telegramBotToken: config.telegramBotToken,
-    telegramForumChatId: config.telegramForumChatId,
-    allowedTelegramUserIds: [...config.allowedTelegramUserIds].join(','),
-    mongoUri: config.mongoUri,
-    mongoDbName: config.mongoDbName,
-    mongoCollectionName: config.mongoCollectionName,
-    ocrQueueCollectionName: config.ocrQueueCollectionName,
-    zaloLoginMode: config.zaloLoginMode,
-    zaloSelfListen: config.zaloSelfListen,
-    zaloCredentialsFile: config.zaloCredentialsFile,
-    dataFile: config.dataFile,
-    downloadDir: config.downloadDir,
-    localIngestUrl: config.localIngestUrl,
-    localIngestToken: config.localIngestToken,
-    localIngestZaloTitle: config.localIngestZaloTitle,
-    autoStart: true,
-    enabled: true,
-  };
-
-  const controller = new BridgeController(account, {
-    logger,
+  const manager = new BridgeManager({
+    baseDir: config.rootDir,
+    consoleOutput: process.env.NODE_ENV !== 'production',
   });
+  await manager.load();
 
   const webServer = startWebServer({
     port: config.webPort,
     accessToken: config.webAccessToken,
     logger,
-    getQrPath: () => controller.qrPath,
-    getStatus: () => ({
-      status: controller.status,
-      startedAt: controller.startedAt,
-      lastError: controller.lastError,
-      qrImageBase64: controller.qrImageBase64,
-      listenerConnected: controller.listenerConnected,
-      accountName: controller.zalo?.selfProfile?.displayName || controller.zalo?.selfProfile?.zaloName || account.label,
-      webAccessProtected: Boolean(config.webAccessToken),
-    }),
+    getQrPath: (accountId) => {
+      const id = accountId || manager.getState().selectedAccountId;
+      return id ? manager.getController(id)?.qrPath : null;
+    },
+    getStatus: () => {
+      const state = manager.getState();
+      const accounts = state.accounts.map((account) => {
+        const controller = manager.getController(account.id);
+        const snapshot = controller?.snapshot() || {};
+        return {
+          id: account.id,
+          label: account.label,
+          status: snapshot.status || account.status,
+          startedAt: snapshot.startedAt || account.startedAt || null,
+          lastError: snapshot.lastError || account.lastError || null,
+          qrImageBase64: snapshot.qrImageBase64 || null,
+          listenerConnected: Boolean(snapshot.listenerConnected),
+          accountName:
+            controller?.zalo?.selfProfile?.displayName ||
+            controller?.zalo?.selfProfile?.zaloName ||
+            account.label,
+          conversationCount: snapshot.conversations?.length || account.conversationCount || 0,
+        };
+      });
+      return {
+        status: accounts.some((account) => account.status === 'running') ? 'running' : 'starting',
+        accounts,
+        selectedAccountId: state.selectedAccountId,
+        webAccessProtected: Boolean(config.webAccessToken),
+      };
+    },
   });
 
   async function shutdown(reason) {
-    await controller.stop(reason);
+    await manager.stopAll(reason);
     webServer.close();
   }
 
-  await controller.start();
+  await manager.startAll();
 
   process.once('SIGINT', () => void shutdown('SIGINT'));
   process.once('SIGTERM', () => void shutdown('SIGTERM'));
