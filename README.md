@@ -222,6 +222,41 @@ After deploy:
 
 With MongoDB enabled, redeploying Koyeb does not lose Zalo sessions or topic mappings. Temporary downloaded images may be stored in `/tmp` while forwarding, then deleted after use.
 
+## Keep Koyeb Awake With Cron
+
+You can use an external cron monitor to ping the health endpoint every few minutes:
+
+```text
+https://your-koyeb-app.koyeb.app/healthz
+```
+
+Suggested interval:
+
+```text
+*/5 * * * *
+```
+
+Any cron/uptime service that can send an HTTP GET request is fine. Examples:
+
+- cron-job.org
+- UptimeRobot
+- EasyCron
+- GitHub Actions scheduled workflow
+
+The `/healthz` endpoint returns:
+
+```text
+ok
+```
+
+`/healthz` does not require `WEB_ACCESS_TOKEN`, so uptime monitors can call it directly. Keep `WEB_ACCESS_TOKEN` enabled for the QR/status pages:
+
+```text
+https://your-koyeb-app.koyeb.app/?token=YOUR_WEB_ACCESS_TOKEN
+```
+
+This ping only keeps the web service responsive. The persistent data still comes from MongoDB, so keep `MONGODB_URI` configured.
+
 ## Web Endpoints
 
 - `/` or `/qr-login` shows QR login cards and runtime status.
