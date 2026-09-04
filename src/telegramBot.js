@@ -27,6 +27,10 @@ function telegramSenderName(ctx) {
   return ctx.from?.username || parts.join(' ') || String(ctx.from?.id || 'Telegram');
 }
 
+function humanError(error) {
+  return String(error?.response?.description || error?.message || error || 'Unknown error').slice(0, 500);
+}
+
 export class TelegramBridgeBot {
   constructor({ config, store, zalo, logger, pendingEcho, onTranscript }) {
     this.config = config;
@@ -231,9 +235,12 @@ export class TelegramBridgeBot {
 
     const largestPhoto = ctx.message.photo.at(-1);
     const targetPath = await this.downloadTelegramFile(ctx, largestPhoto.file_id, largestPhoto.file_unique_id, 'jpg');
+    this.logger.info(
+      { topicId: ctx.message.message_thread_id, conversationId: mapping.conversationId, filePath: targetPath },
+      'Downloaded Telegram photo for Zalo forwarding.',
+    );
 
     this.pendingEcho?.register?.(mapping.conversationId);
-    let sent = false;
     try {
       await this.zalo.sendImage({
         conversationId: mapping.conversationId,
@@ -241,14 +248,20 @@ export class TelegramBridgeBot {
         filePath: targetPath,
         caption: ctx.message.caption,
       });
-      sent = true;
+      this.logger.info(
+        { topicId: ctx.message.message_thread_id, conversationId: mapping.conversationId },
+        'Forwarded Telegram photo to Zalo.',
+      );
     } catch (error) {
       this.pendingEcho?.consume?.(mapping.conversationId);
+      this.logger.error(
+        { error, topicId: ctx.message.message_thread_id, conversationId: mapping.conversationId },
+        'Could not forward Telegram photo to Zalo.',
+      );
+      await ctx.reply(`Không gửi được ảnh sang Zalo.\n${humanError(error)}`);
       throw error;
     } finally {
-      if (sent) {
-        await this.cleanupTelegramFile(targetPath);
-      }
+      await this.cleanupTelegramFile(targetPath);
     }
     await this.onTranscript?.(mapping, {
       direction: 'out',
@@ -278,9 +291,12 @@ export class TelegramBridgeBot {
       ctx.message.document.file_unique_id,
       extension,
     );
+    this.logger.info(
+      { topicId: ctx.message.message_thread_id, conversationId: mapping.conversationId, filePath: targetPath },
+      'Downloaded Telegram image document for Zalo forwarding.',
+    );
 
     this.pendingEcho?.register?.(mapping.conversationId);
-    let sent = false;
     try {
       await this.zalo.sendImage({
         conversationId: mapping.conversationId,
@@ -288,14 +304,20 @@ export class TelegramBridgeBot {
         filePath: targetPath,
         caption: ctx.message.caption,
       });
-      sent = true;
+      this.logger.info(
+        { topicId: ctx.message.message_thread_id, conversationId: mapping.conversationId },
+        'Forwarded Telegram image document to Zalo.',
+      );
     } catch (error) {
       this.pendingEcho?.consume?.(mapping.conversationId);
+      this.logger.error(
+        { error, topicId: ctx.message.message_thread_id, conversationId: mapping.conversationId },
+        'Could not forward Telegram image document to Zalo.',
+      );
+      await ctx.reply(`Không gửi được ảnh sang Zalo.\n${humanError(error)}`);
       throw error;
     } finally {
-      if (sent) {
-        await this.cleanupTelegramFile(targetPath);
-      }
+      await this.cleanupTelegramFile(targetPath);
     }
     await this.onTranscript?.(mapping, {
       direction: 'out',
@@ -313,6 +335,7 @@ export class TelegramBridgeBot {
     const fileLink = await ctx.telegram.getFileLink(fileId);
     const extension = fileLink.pathname.split('.').pop() || fallbackExtension;
     const targetPath = uniqueDownloadPath(this.config.downloadDir, `telegram-${uniqueId}`, extension);
+    await ensureDir(this.config.downloadDir);
 
     const response = await fetch(fileLink);
     if (!response.ok) {
