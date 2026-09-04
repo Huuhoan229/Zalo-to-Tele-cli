@@ -321,9 +321,9 @@ export class ZaloClient extends EventEmitter {
   async sendImage({ conversationId, threadType, filePath, caption }) {
     if (!this.api) throw new Error('Zalo is not connected');
     const payload = {
+      msg: caption || '',
       attachments: [path.resolve(filePath)],
     };
-    if (caption) payload.msg = caption;
     await this.api.sendMessage(payload, conversationId, threadType);
   }
 }
