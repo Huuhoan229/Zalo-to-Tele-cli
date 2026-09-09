@@ -47,6 +47,7 @@ export class BridgeController extends EventEmitter {
     this.qrPath = null;
     this.qrImageBase64 = null;
     this.listenerConnected = false;
+    this.restartAttempts = 0;
     this.ready = this.store.load();
   }
 
@@ -165,6 +166,7 @@ export class BridgeController extends EventEmitter {
       await this.telegram.start();
       this.startedAt = new Date().toISOString();
       this.lastActivityAt = Date.now();
+      this.restartAttempts = 0; // reset backoff khi start thành công
       this.status = 'running';
       this.emitChange();
       return this.snapshot();
@@ -219,7 +221,13 @@ export class BridgeController extends EventEmitter {
     if (this.restartTimer || this.manualStop) return;
     this.status = 'reconnecting';
     this.lastError = reason;
-    this.logger.warn({ reason }, 'Scheduling bridge reconnect.');
+
+    // Exponential backoff: 10s, 20s, 40s, 80s, tối đa 120s
+    const baseDelay = 10000;
+    const delay = Math.min(baseDelay * Math.pow(2, this.restartAttempts), 120000);
+    this.restartAttempts = (this.restartAttempts || 0) + 1;
+
+    this.logger.warn({ reason, delayMs: delay, attempt: this.restartAttempts }, 'Scheduling bridge reconnect.');
     this.emitChange();
 
     this.restartTimer = setTimeout(() => {
@@ -230,7 +238,7 @@ export class BridgeController extends EventEmitter {
         this.emitChange();
         this.scheduleRestart(this.lastError);
       });
-    }, 10000);
+    }, delay);
   }
 
   async restart(reason) {
@@ -245,6 +253,10 @@ export class BridgeController extends EventEmitter {
       this.zalo = null;
       this.suppressZaloClosed = false;
     }
+
+    // Chờ một chút để Telegram server giải phóng session getUpdates cũ
+    // trước khi launch lại, giảm khả năng bị 409 Conflict.
+    await new Promise((resolve) => setTimeout(resolve, 3000));
 
     this.status = 'idle';
     await this.start();

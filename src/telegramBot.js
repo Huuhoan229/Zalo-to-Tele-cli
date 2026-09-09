@@ -48,6 +48,16 @@ class SharedTelegramRuntime {
     this.started = false;
   }
 
+  _recreateBot() {
+    // Tạo mới Telegraf instance để tránh state cũ gây lỗi sau khi stop.
+    this.bot = new Telegraf(this.config.telegramBotToken);
+    this.handlersRegistered = false;
+    // Cập nhật lại reference bot cho tất cả bridges đang dùng runtime này.
+    for (const bridge of this.bridges) {
+      bridge.bot = this.bot;
+    }
+  }
+
   addBridge(bridge) {
     this.bridges.add(bridge);
     this.registerHandlers();
@@ -63,6 +73,22 @@ class SharedTelegramRuntime {
 
   async start() {
     if (this.started) return;
+
+    // Recreate the bot instance if it was previously stopped to avoid
+    // Telegraf internal state issues after bot.stop().
+    if (!this.handlersRegistered) {
+      this._recreateBot();
+    }
+
+    // Xóa webhook và kick bất kỳ session getUpdates cũ nào trước khi launch.
+    // Đây là cách fix chuẩn cho lỗi 409 Conflict.
+    try {
+      await this.bot.telegram.deleteWebhook({ drop_pending_updates: false });
+    } catch (err) {
+      this.logger.warn({ err }, 'deleteWebhook failed (non-fatal), continuing launch.');
+    }
+
+    this.registerHandlers();
     await this.bot.launch();
     this.started = true;
     this.logger.info('Telegram bot started');
