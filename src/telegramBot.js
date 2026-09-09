@@ -80,12 +80,15 @@ class SharedTelegramRuntime {
       this._recreateBot();
     }
 
-    // Xóa webhook và kick bất kỳ session getUpdates cũ nào trước khi launch.
-    // Đây là cách fix chuẩn cho lỗi 409 Conflict.
+    // Gọi getUpdates với timeout=0 để Telegram server TERMINATE ngay session
+    // polling đang chạy từ instance cũ. deleteWebhook() KHÔNG có tác dụng với
+    // long-polling — chỉ có cách này mới kick được session 409 Conflict.
     try {
-      await this.bot.telegram.deleteWebhook({ drop_pending_updates: false });
+      await this.bot.telegram.callApi('getUpdates', { timeout: 0, offset: -1 });
+      this.logger.info('Kicked stale getUpdates session before launch.');
     } catch (err) {
-      this.logger.warn({ err }, 'deleteWebhook failed (non-fatal), continuing launch.');
+      // 409 ở đây là bình thường, nghĩa là đang kick session cũ thành công
+      this.logger.warn({ code: err?.response?.error_code }, 'Pre-launch getUpdates kick (may 409, that is OK).');
     }
 
     this.registerHandlers();
