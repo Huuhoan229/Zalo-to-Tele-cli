@@ -2,6 +2,7 @@ import pino from 'pino';
 import { config } from './config.js';
 import { BridgeManager } from './bridgeManager.js';
 import { startWebServer } from './webServer.js';
+import { webhookHandlers } from './telegramBot.js';
 
 const logger = pino({
   level: config.logLevel,
@@ -25,6 +26,7 @@ async function main() {
     port: config.webPort,
     accessToken: config.webAccessToken,
     logger,
+    webhookHandlers,
     getQrPath: (accountId) => {
       const id = accountId || manager.getState().selectedAccountId;
       return id ? manager.getController(id)?.qrPath : null;

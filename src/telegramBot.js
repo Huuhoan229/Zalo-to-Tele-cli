@@ -1,9 +1,23 @@
+import crypto from 'node:crypto';
 import { Input, Telegraf } from 'telegraf';
 import { message } from 'telegraf/filters';
 import fs from 'node:fs/promises';
 import { ensureDir, uniqueDownloadPath } from './media.js';
 
 const runtimes = new Map();
+
+/**
+ * Global registry: webhookPath → Telegraf webhookCallback handler.
+ * The HTTP server reads this Map to route incoming Telegram updates.
+ * Exported so cli.js can pass it to startWebServer().
+ */
+export const webhookHandlers = new Map();
+
+function webhookPathForToken(token) {
+  // Derive a secret path from the bot token so random HTTP clients can't
+  // fake Telegram updates. 24 hex chars = 96-bit entropy.
+  return `/telegram-webhook/${crypto.createHash('sha256').update(token).digest('hex').slice(0, 24)}`;
+}
 
 function topicName(title, accountLabel = '') {
   const prefix = accountLabel ? `[${accountLabel}] ` : '';
@@ -46,6 +60,15 @@ class SharedTelegramRuntime {
     this.bridges = new Set();
     this.handlersRegistered = false;
     this.started = false;
+    // Webhook mode: đọc TELEGRAM_WEBHOOK_URL từ env (setting toàn deployment).
+    // Nếu không set → fallback về long polling (chạy local).
+    const webhookBaseUrl = process.env.TELEGRAM_WEBHOOK_URL?.trim().replace(/\/$/, '') || '';
+    this.webhookBaseUrl = webhookBaseUrl;
+    this.webhookPath = webhookBaseUrl ? webhookPathForToken(config.telegramBotToken) : null;
+  }
+
+  get isWebhookMode() {
+    return Boolean(this.webhookBaseUrl && this.webhookPath);
   }
 
   _recreateBot() {
@@ -66,7 +89,13 @@ class SharedTelegramRuntime {
   removeBridge(bridge, reason = 'manual') {
     this.bridges.delete(bridge);
     if (this.bridges.size === 0 && this.started) {
-      this.bot.stop(reason);
+      if (this.isWebhookMode) {
+        // Xoá webhook handler khỏi registry và notify Telegram xoá webhook.
+        webhookHandlers.delete(this.webhookPath);
+        this.bot.telegram.deleteWebhook().catch(() => {});
+      } else {
+        this.bot.stop(reason);
+      }
       this.started = false;
     }
   }
@@ -74,27 +103,34 @@ class SharedTelegramRuntime {
   async start() {
     if (this.started) return;
 
-    // Recreate the bot instance if it was previously stopped to avoid
-    // Telegraf internal state issues after bot.stop().
     if (!this.handlersRegistered) {
       this._recreateBot();
     }
-
-    // Gọi getUpdates với timeout=0 để Telegram server TERMINATE ngay session
-    // polling đang chạy từ instance cũ. deleteWebhook() KHÔNG có tác dụng với
-    // long-polling — chỉ có cách này mới kick được session 409 Conflict.
-    try {
-      await this.bot.telegram.callApi('getUpdates', { timeout: 0, offset: -1 });
-      this.logger.info('Kicked stale getUpdates session before launch.');
-    } catch (err) {
-      // 409 ở đây là bình thường, nghĩa là đang kick session cũ thành công
-      this.logger.warn({ code: err?.response?.error_code }, 'Pre-launch getUpdates kick (may 409, that is OK).');
-    }
-
     this.registerHandlers();
-    await this.bot.launch();
-    this.started = true;
-    this.logger.info('Telegram bot started');
+
+    if (this.isWebhookMode) {
+      // --- WEBHOOK MODE ---
+      // Telegram sẽ push updates về URL này thay vì bot phải poll.
+      // Không bao giờ bị 409 Conflict vì không có getUpdates cạnh tranh.
+      const fullUrl = `${this.webhookBaseUrl}${this.webhookPath}`;
+      await this.bot.telegram.setWebhook(fullUrl);
+      // Đăng ký handler vào Map để HTTP server route vào.
+      webhookHandlers.set(this.webhookPath, this.bot.webhookCallback(this.webhookPath));
+      this.started = true;
+      this.logger.info({ url: fullUrl }, 'Telegram webhook registered.');
+    } else {
+      // --- LONG POLLING MODE (local dev fallback) ---
+      // Kick session cũ trước để tránh 409 Conflict khi restart.
+      try {
+        await this.bot.telegram.callApi('getUpdates', { timeout: 0, offset: -1 });
+        this.logger.info('Kicked stale getUpdates session before launch.');
+      } catch (err) {
+        this.logger.warn({ code: err?.response?.error_code }, 'Pre-launch getUpdates kick (may 409, that is OK).');
+      }
+      await this.bot.launch();
+      this.started = true;
+      this.logger.info('Telegram bot started (long polling).');
+    }
   }
 
   findBridgeByTopic(topicId) {

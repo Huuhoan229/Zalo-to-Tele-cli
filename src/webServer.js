@@ -178,13 +178,25 @@ async function fileExists(filePath) {
   }
 }
 
-export function startWebServer({ port, accessToken, getStatus, getQrPath, logger }) {
+export function startWebServer({ port, accessToken, getStatus, getQrPath, logger, webhookHandlers }) {
   const server = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url || '/', 'http://localhost');
 
       if (url.pathname === '/healthz') {
         send(res, 200, 'ok\n', { 'Content-Type': 'text/plain; charset=utf-8' });
+        return;
+      }
+
+      // Telegram webhook: route POST /telegram-webhook/<hash> vào Telegraf handler.
+      // Phải để TRƯỚC auth check vì Telegram không gửi access token của chúng ta.
+      if (req.method === 'POST' && url.pathname.startsWith('/telegram-webhook/')) {
+        const handler = webhookHandlers?.get(url.pathname);
+        if (handler) {
+          handler(req, res);
+          return;
+        }
+        send(res, 404, 'Webhook path not registered\n', { 'Content-Type': 'text/plain; charset=utf-8' });
         return;
       }
 
