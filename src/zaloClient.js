@@ -292,14 +292,17 @@ export class ZaloClient extends EventEmitter {
       isGroup,
       isSelf,
       senderName: isSelf ? 'Tôi' : pickSenderName(message),
-      title: await this.resolveConversationTitle(message, isGroup),
+      title: await this.resolveConversationTitle(message, isGroup, isSelf),
       text: pickText(content),
       attachment,
       raw: message,
     };
   }
 
-  async resolveConversationTitle(message, isGroup) {
+  async resolveConversationTitle(message, isGroup, isSelf = false) {
+    // Chat 1-1 mà là tin nhắn của chính mình: trả về null để không
+    // rename topic sang tên của mình. Topic luôn giữ tên người đối diện.
+    if (!isGroup && isSelf) return null;
     if (!isGroup) return pickConversationTitle(message, false);
 
     try {
