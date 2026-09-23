@@ -34,7 +34,9 @@ function isTelegramThreadNotFound(error) {
 }
 
 function formatZaloMessage(zaloMessage) {
-  const prefix = zaloMessage.isGroup ? `[${zaloMessage.senderName}]` : `[${zaloMessage.title}]`;
+  const prefix = zaloMessage.isGroup
+    ? `[${zaloMessage.senderName}]`
+    : `[${zaloMessage.title || zaloMessage.senderName}]`;
   const body = zaloMessage.text || zaloMessage.attachment?.title || '(non-text message)';
   return `${prefix}\n${body}`;
 }
