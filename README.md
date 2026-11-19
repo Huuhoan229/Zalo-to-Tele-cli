@@ -10,7 +10,7 @@ Bridge one or more personal Zalo accounts to one Telegram forum group.
 - Sends Telegram replies, photos, and image documents back to the correct Zalo conversation.
 - Creates one Telegram topic per Zalo conversation.
 - Supports multiple Zalo accounts with one Telegram bot and one Telegram forum group.
-- Stores Zalo sessions and Telegram topic mappings in MongoDB, so Koyeb free redeploys do not wipe the bridge state.
+- Stores Zalo sessions and Telegram topic mappings in MongoDB, so Render redeploys do not wipe the bridge state.
 - Queues matched Zalo messages into MongoDB for a separate local OCR worker.
 
 ## Message Flow
@@ -62,23 +62,25 @@ npm run telegram:id
 ```
 
 Then send `/id` inside the Telegram group. Use the `chat_id` value for `TELEGRAM_FORUM_CHAT_ID`. It usually starts with `-100`.
-Put your Telegram user ID in `ALLOWED_TELEGRAM_USER_IDS`. An empty allowlist disables Telegram-to-Zalo forwarding; `/id` remains available so you can look up the ID.
+Put each authorized Telegram user ID in `ALLOWED_TELEGRAM_USER_IDS`. An empty allowlist disables Telegram-to-Zalo forwarding; `/id` remains available so you can look up the ID.
 
 ### Allow Telegram replies to reach Zalo
 
-For Koyeb, open **App -> Service -> Settings -> Environment variables**, then add:
+In the Render dashboard, open the service's **Environment** settings and set:
 
 ```env
 ALLOWED_TELEGRAM_USER_IDS=123456789
 ```
 
-Find your numeric Telegram user ID by sending `/id` in the forum group. For multiple users, use a comma-separated list. Save the changes and redeploy the Koyeb service. This deployment variable overrides any older allowlist value saved in the MongoDB account registry.
+Find your numeric Telegram user ID by sending `/id` in the forum group. For multiple users, use a comma-separated list. Save the changes and redeploy the Render service. This deployment variable overrides any older allowlist value saved in the MongoDB account registry.
 
-To send a Zalo message, reply in the Telegram forum topic linked to that Zalo conversation. The bot and Zalo account must both be running. The bot now replies in the topic with a permission or delivery error when it cannot forward the message.
+To send a Zalo message, send text in the Telegram forum topic linked to that Zalo conversation. Photos and image documents are also forwarded. The Telegram bot and mapped Zalo account must both be running. If sending fails, the bot replies in the topic with the permission or delivery error.
+
+If a message does not reach Zalo, check that it is in the correct mapped topic, the Zalo account is running, and your numeric Telegram user ID is included in `ALLOWED_TELEGRAM_USER_IDS`. Use `/topics` to inspect topic mappings and `/id` to check the sender ID. Render's service logs show delivery errors; the bot also replies with the returned error in the topic.
 
 ## MongoDB Setup
 
-MongoDB is recommended for Koyeb free because Koyeb free does not provide a persistent volume.
+MongoDB is recommended for Render Free because the service filesystem is ephemeral.
 
 MongoDB stores:
 
@@ -100,7 +102,7 @@ TRANSCRIPT_FULL_RETENTION_DAYS=1
 TRANSCRIPT_RETENTION_DAYS=7
 ```
 
-If MongoDB Atlas cannot connect from Koyeb, check the Atlas Network Access/IP allowlist.
+If MongoDB Atlas cannot connect from Render, check the Atlas Network Access/IP allowlist.
 
 ## Single Zalo Account
 
@@ -152,7 +154,7 @@ Pretty JSON:
 ]
 ```
 
-Koyeb env value can be pasted as one line:
+Paste the `ACCOUNTS_JSON` value as one line in the Render environment settings:
 
 ```env
 ACCOUNTS_JSON=[{"id":"zalo-1","label":"Zalo 1","zaloLoginMode":"qr","localIngestZaloTitle":"nhom 2"},{"id":"zalo-2","label":"Zalo 2","zaloLoginMode":"qr","localIngestZaloTitle":"nhom 2"}]
@@ -187,9 +189,9 @@ Per-account optional fields:
 }
 ```
 
-## Koyeb Deployment
+## Render Deployment
 
-Deploy this repository as a Koyeb Web Service.
+Deploy this repository as a Render Web Service using the included `render.yaml` Blueprint.
 
 Build command:
 
@@ -203,9 +205,9 @@ Run command:
 npm start
 ```
 
-Koyeb sets `PORT` automatically. The app listens on `0.0.0.0`.
+Render sets `PORT` automatically. The app listens on `0.0.0.0`.
 
-Recommended Koyeb env vars:
+Set the required Render environment variables:
 
 ```env
 TELEGRAM_BOT_TOKEN=...
@@ -228,36 +230,25 @@ LOG_LEVEL=info
 
 For multiple Zalo accounts, add `ACCOUNTS_JSON` from the section above.
 
-After deploy:
+After deployment:
 
-1. Open `https://your-koyeb-app.koyeb.app/?token=YOUR_WEB_ACCESS_TOKEN`.
+1. Open `https://<your-service>.onrender.com/?token=YOUR_WEB_ACCESS_TOKEN`.
 2. Scan the QR card for each Zalo account.
 3. Confirm login on each Zalo mobile account.
 4. Send a message in the watched Zalo conversation.
 5. The bot creates or reuses the correct Telegram topic and forwards the message.
 6. Reply inside that Telegram topic to send back to the same Zalo conversation.
 
-With MongoDB enabled, redeploying Koyeb does not lose Zalo sessions or topic mappings. Temporary downloaded images may be stored in `/tmp` while forwarding, then deleted after use.
+With MongoDB enabled, redeploying Render does not lose Zalo sessions or topic mappings. Temporary downloaded images may be stored in `/tmp` while forwarding, then deleted after use.
 
-## Render Deployment
+Render Free services may sleep after a period without inbound web traffic. A periodic external request to `/healthz` can keep the service active, but uses its free instance hours. When the service sleeps, Telegram polling and the Zalo listener pause until it wakes.
 
-This repository includes a Render Blueprint at `render.yaml`. Create a Blueprint from this repository and set:
-
-- `WEB_ACCESS_TOKEN`: a long private token protecting the QR and account-management page.
-- `TELEGRAM_BOT_TOKEN` and `TELEGRAM_FORUM_CHAT_ID`.
-- `MONGODB_URI`: use MongoDB Atlas or another MongoDB service. Render Free has an ephemeral filesystem, so MongoDB is needed to retain Zalo sessions, account registry, and chat mappings across restarts.
-- `ALLOWED_TELEGRAM_USER_IDS`: Telegram user ID(s) permitted to send messages back to Zalo. Use `/id` to look them up; separate multiple IDs with commas.
-
-After the first deploy, Render assigns a service URL. Open `https://<your-service>.onrender.com/?token=<WEB_ACCESS_TOKEN>`. The page has a "+ Thêm tài khoản Zalo" button; each added account gets a QR card and the account list is saved in MongoDB. The same page supports QR relogin and account removal.
-
-Render Free services sleep after 15 minutes without inbound web traffic. A periodic external request to `/healthz` can keep a service active, but that consumes its free instance hours. Two continuously active services use the shared workspace allowance twice as quickly.
-
-## Keep Koyeb Awake With Cron
+## Keep Render Awake With Cron
 
 You can use an external cron monitor to ping the health endpoint every few minutes:
 
 ```text
-https://your-koyeb-app.koyeb.app/healthz
+https://<your-service>.onrender.com/healthz
 ```
 
 Suggested interval:
@@ -282,10 +273,10 @@ ok
 `/healthz` does not require `WEB_ACCESS_TOKEN`, so uptime monitors can call it directly. Keep `WEB_ACCESS_TOKEN` enabled for the QR/status pages:
 
 ```text
-https://your-koyeb-app.koyeb.app/?token=YOUR_WEB_ACCESS_TOKEN
+https://<your-service>.onrender.com/?token=YOUR_WEB_ACCESS_TOKEN
 ```
 
-This ping only keeps the web service responsive. The persistent data still comes from MongoDB, so keep `MONGODB_URI` configured.
+This ping keeps the web service responsive and may consume Render's free instance hours. The persistent data still comes from MongoDB, so keep `MONGODB_URI` configured.
 
 ## Web Endpoints
 
