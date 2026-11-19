@@ -267,7 +267,7 @@ class SharedTelegramRuntime {
         },
         'Could not forward Telegram message to Zalo.',
       );
-      await ctx.reply(\`Không gửi được sang Zalo.\\n\${humanError(error)}\`).catch(() => {});
+      await ctx.reply(`Không gửi được sang Zalo.\n${humanError(error)}`).catch(() => {});
     } finally {
       if (dedupeKey) this.inFlightUpdates.delete(dedupeKey);
     }
