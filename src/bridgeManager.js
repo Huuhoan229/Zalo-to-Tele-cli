@@ -71,7 +71,14 @@ export class BridgeManager extends EventEmitter {
     const savedAccounts = registry?.accounts;
     this.accounts = (savedAccounts || file.accounts).map((account) => {
       const configured = file.accounts.find((item) => item.id === account.id);
-      return normalizeAccount(configured ? { ...account, ...configured } : account, this.baseDir);
+      const merged = configured ? { ...account, ...configured } : account;
+      return normalizeAccount({
+        ...merged,
+        // Deployment-level access control must override stale Mongo registry values.
+        ...(process.env.ALLOWED_TELEGRAM_USER_IDS !== undefined
+          ? { allowedTelegramUserIds: process.env.ALLOWED_TELEGRAM_USER_IDS }
+          : {}),
+      }, this.baseDir);
     });
     if (!registry && this.accounts.length === 0) {
       const seeded = createSeedAccountFromEnv(this.baseDir);

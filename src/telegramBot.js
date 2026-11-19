@@ -256,6 +256,18 @@ class SharedTelegramRuntime {
           this.processedUpdates.delete(this.processedUpdates.keys().next().value);
         }
       }
+    } catch (error) {
+      this.logger.error(
+        {
+          error,
+          updateId,
+          topicId: ctx.message.message_thread_id,
+          accountId: routed.bridge.config.accountId,
+          conversationId: routed.mapping.conversationId,
+        },
+        'Could not forward Telegram message to Zalo.',
+      );
+      await ctx.reply(\`Không gửi được sang Zalo.\\n\${humanError(error)}\`).catch(() => {});
     } finally {
       if (dedupeKey) this.inFlightUpdates.delete(dedupeKey);
     }
@@ -416,7 +428,12 @@ export class TelegramBridgeBot {
   async forwardTelegramText(ctx, mapped = null) {
     if (ctx.chat?.id !== this.config.telegramForumChatId) return;
     if (!ctx.message.message_thread_id) return;
-    if (!isAllowed(this.config, ctx.from.id)) return;
+    if (!isAllowed(this.config, ctx.from.id)) {
+      await ctx.reply(
+        \`Bạn chưa được cấp quyền gửi sang Zalo. Telegram user ID của bạn là \${ctx.from?.id}. Thêm ID này vào ALLOWED_TELEGRAM_USER_IDS trên Koyeb rồi redeploy.\`,
+      );
+      return;
+    }
 
     const mapping = mapped || this.store.getByTopic(ctx.message.message_thread_id);
     if (!mapping) return;
@@ -452,7 +469,12 @@ export class TelegramBridgeBot {
       await ctx.reply('Ảnh này chưa nằm trong topic Zalo nào nên không biết gửi về đâu.');
       return;
     }
-    if (!isAllowed(this.config, ctx.from.id)) return;
+    if (!isAllowed(this.config, ctx.from.id)) {
+      await ctx.reply(
+        \`Bạn chưa được cấp quyền gửi sang Zalo. Telegram user ID của bạn là \${ctx.from?.id}. Thêm ID này vào ALLOWED_TELEGRAM_USER_IDS trên Koyeb rồi redeploy.\`,
+      );
+      return;
+    }
 
     const mapping = mapped || this.store.getByTopic(ctx.message.message_thread_id);
     if (!mapping) {
@@ -512,7 +534,12 @@ export class TelegramBridgeBot {
       await ctx.reply('Ảnh này chưa nằm trong topic Zalo nào nên không biết gửi về đâu.');
       return;
     }
-    if (!isAllowed(this.config, ctx.from.id)) return;
+    if (!isAllowed(this.config, ctx.from.id)) {
+      await ctx.reply(
+        \`Bạn chưa được cấp quyền gửi sang Zalo. Telegram user ID của bạn là \${ctx.from?.id}. Thêm ID này vào ALLOWED_TELEGRAM_USER_IDS trên Koyeb rồi redeploy.\`,
+      );
+      return;
+    }
     if (!ctx.message.document.mime_type?.startsWith('image/')) return;
 
     const mapping = mapped || this.store.getByTopic(ctx.message.message_thread_id);

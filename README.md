@@ -64,6 +64,18 @@ npm run telegram:id
 Then send `/id` inside the Telegram group. Use the `chat_id` value for `TELEGRAM_FORUM_CHAT_ID`. It usually starts with `-100`.
 Put your Telegram user ID in `ALLOWED_TELEGRAM_USER_IDS`. An empty allowlist disables Telegram-to-Zalo forwarding; `/id` remains available so you can look up the ID.
 
+### Allow Telegram replies to reach Zalo
+
+For Koyeb, open **App -> Service -> Settings -> Environment variables**, then add:
+
+```env
+ALLOWED_TELEGRAM_USER_IDS=123456789
+```
+
+Find your numeric Telegram user ID by sending `/id` in the forum group. For multiple users, use a comma-separated list. Save the changes and redeploy the Koyeb service. This deployment variable overrides any older allowlist value saved in the MongoDB account registry.
+
+To send a Zalo message, reply in the Telegram forum topic linked to that Zalo conversation. The bot and Zalo account must both be running. The bot now replies in the topic with a permission or delivery error when it cannot forward the message.
+
 ## MongoDB Setup
 
 MongoDB is recommended for Koyeb free because Koyeb free does not provide a persistent volume.
