@@ -102,6 +102,8 @@ export class BridgeManager extends EventEmitter {
             mongoDbName: account.mongoDbName,
             mongoCollectionName: account.mongoCollectionName,
             ocrQueueCollectionName: account.ocrQueueCollectionName,
+            transcriptFullRetentionDays: account.transcriptFullRetentionDays,
+            transcriptRetentionDays: account.transcriptRetentionDays,
             zaloLoginMode: account.zaloLoginMode,
             zaloSelfListen: account.zaloSelfListen,
             zaloCredentialsFile: account.zaloCredentialsFile,

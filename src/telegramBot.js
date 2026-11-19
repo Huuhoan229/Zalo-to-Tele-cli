@@ -344,7 +344,7 @@ export class TelegramBridgeBot {
     try {
       if (
         messageId &&
-        this.store.listMessages(zaloMessage.conversationId).some((entry) => String(entry.id) === messageId)
+        this.store.listMessages(zaloMessage.conversationId, 500).some((entry) => String(entry.id) === messageId)
       ) return;
 
     let mapping = await this.ensureTopicForZaloMessage(zaloMessage);

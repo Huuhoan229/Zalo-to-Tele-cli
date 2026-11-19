@@ -16,7 +16,10 @@ const logger = pino({
 });
 
 async function main() {
-  const store = new Store(config.dataFile);
+  const store = new Store(config.dataFile, {
+    transcriptFullRetentionDays: config.transcriptFullRetentionDays,
+    transcriptRetentionDays: config.transcriptRetentionDays,
+  });
   await store.load();
 
   const zalo = await new ZaloClient({

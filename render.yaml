@@ -26,5 +26,9 @@ services:
         value: bridge_state
       - key: MONGODB_QUEUE_COLLECTION_NAME
         value: ocr_queue
+      - key: TRANSCRIPT_FULL_RETENTION_DAYS
+        value: "1"
+      - key: TRANSCRIPT_RETENTION_DAYS
+        value: "7"
       - key: ZALO_LOGIN_MODE
         value: qr

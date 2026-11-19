@@ -14,6 +14,12 @@ function slugify(value) {
     .slice(0, 36) || `account-${crypto.randomUUID().slice(0, 8)}`;
 }
 
+function positiveNumber(value, fallback) {
+  if (value === undefined || value === null || String(value).trim() === '') return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 export function resolveAccountPaths(id, baseDir = process.cwd()) {
   return {
     zaloCredentialsFile: path.join(baseDir, 'sessions', id, 'zalo-credentials.json'),
@@ -42,6 +48,14 @@ export function normalizeAccount(input, baseDir = process.cwd()) {
     mongoDbName: String(input.mongoDbName || process.env.MONGODB_DB_NAME || 'zalo-to-tele').trim(),
     mongoCollectionName: String(input.mongoCollectionName || process.env.MONGODB_COLLECTION_NAME || 'bridge_state').trim(),
     ocrQueueCollectionName: String(input.ocrQueueCollectionName || process.env.MONGODB_QUEUE_COLLECTION_NAME || 'ocr_queue').trim(),
+    transcriptFullRetentionDays: positiveNumber(
+      input.transcriptFullRetentionDays ?? process.env.TRANSCRIPT_FULL_RETENTION_DAYS,
+      1,
+    ),
+    transcriptRetentionDays: positiveNumber(
+      input.transcriptRetentionDays ?? process.env.TRANSCRIPT_RETENTION_DAYS,
+      7,
+    ),
     zaloLoginMode:
       loginMode === 'qr' && existsSync(path.resolve(baseDir, credentialsFile)) ? 'auto' : loginMode,
     zaloSelfListen: input.zaloSelfListen !== false,

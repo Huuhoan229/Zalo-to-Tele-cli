@@ -75,6 +75,8 @@ MongoDB stores:
 - Recent bridge messages
 - OCR queue documents
 
+Bridge transcript records are automatically compacted after one day and removed after seven days. The bridge keeps at most 500 recent message records per account for duplicate detection and Telegram-to-Zalo quote replies. These limits can be changed with `TRANSCRIPT_FULL_RETENTION_DAYS` and `TRANSCRIPT_RETENTION_DAYS`. Zalo attachments and stickers are stored as small URL/metadata references, not image bytes.
+
 Use MongoDB Atlas or another MongoDB server, then set:
 
 ```env
@@ -82,6 +84,8 @@ MONGODB_URI=mongodb+srv://user:password@cluster0.example.mongodb.net/?retryWrite
 MONGODB_DB_NAME=zalo-to-tele
 MONGODB_COLLECTION_NAME=bridge_state
 MONGODB_QUEUE_COLLECTION_NAME=ocr_queue
+TRANSCRIPT_FULL_RETENTION_DAYS=1
+TRANSCRIPT_RETENTION_DAYS=7
 ```
 
 If MongoDB Atlas cannot connect from Koyeb, check the Atlas Network Access/IP allowlist.

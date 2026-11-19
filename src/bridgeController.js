@@ -32,6 +32,8 @@ export class BridgeController extends EventEmitter {
       mongoCollectionName: account.mongoCollectionName,
       ocrQueueCollectionName: account.ocrQueueCollectionName,
       accountId: account.id,
+      transcriptFullRetentionDays: account.transcriptFullRetentionDays,
+      transcriptRetentionDays: account.transcriptRetentionDays,
     });
     this.zalo = null;
     this.telegram = null;
@@ -224,8 +226,13 @@ export class BridgeController extends EventEmitter {
 
   startHealthTimer() {
     this.clearHealthTimer();
-    this.healthTimer = setInterval(() => {
+    this.healthTimer = setInterval(async () => {
       if (this.manualStop || this.status !== 'running') return;
+      try {
+        if (this.store.pruneMessageHistory()) await this.store.save();
+      } catch (error) {
+        this.logger.warn({ error }, 'Could not prune expired transcript history.');
+      }
       const idleMs = Date.now() - this.lastActivityAt;
       if (idleMs > 30 * 60 * 1000) {
         this.scheduleRestart(`No Zalo activity for ${Math.round(idleMs / 60000)} minutes`);

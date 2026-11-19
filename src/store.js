@@ -10,6 +10,54 @@ const EMPTY_STATE = {
   messages: {},
   credentials: null,
 };
+const DAY_MS = 24 * 60 * 60 * 1000;
+const MAX_MESSAGES_PER_CONVERSATION = 500;
+const MAX_MESSAGES_PER_ACCOUNT = 500;
+const MAX_STORED_TEXT_BYTES = 4096;
+const MAX_ATTACHMENT_URL_LENGTH = 2048;
+const MAX_QUOTE_DATA_BYTES = 4096;
+
+function boundedString(value, maxLength) {
+  return String(value || '').slice(0, maxLength);
+}
+
+function boundedUtf8String(value, maxBytes) {
+  let result = '';
+  let bytes = 0;
+  for (const character of String(value || '')) {
+    const characterBytes = Buffer.byteLength(character, 'utf8');
+    if (bytes + characterBytes > maxBytes) break;
+    result += character;
+    bytes += characterBytes;
+  }
+  return result;
+}
+
+function storedAttachment(value) {
+  if (!value || typeof value !== 'object') return null;
+  return {
+    ...(value.url ? { url: boundedString(value.url, MAX_ATTACHMENT_URL_LENGTH) } : {}),
+    ...(value.title ? { title: boundedString(value.title, 160) } : {}),
+    ...(value.type ? { type: boundedString(value.type, 32) } : {}),
+    ...(value.stickerId ? { stickerId: boundedString(value.stickerId, 80) } : {}),
+  };
+}
+
+function storedQuoteData(value) {
+  if (!value || typeof value !== 'object') return null;
+  try {
+    const serialized = JSON.stringify(value);
+    if (Buffer.byteLength(serialized, 'utf8') > MAX_QUOTE_DATA_BYTES) return null;
+    return JSON.parse(serialized);
+  } catch {
+    return null;
+  }
+}
+
+function messageTimestamp(message) {
+  const timestamp = Date.parse(message?.createdAt || '');
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
 
 export class Store {
   constructor(
@@ -20,6 +68,8 @@ export class Store {
       mongoCollectionName = 'bridge_state',
       ocrQueueCollectionName = 'ocr_queue',
       accountId = 'primary',
+      transcriptFullRetentionDays = 1,
+      transcriptRetentionDays = 7,
     } = {},
   ) {
     this.filePath = filePath;
@@ -28,6 +78,12 @@ export class Store {
     this.mongoCollectionName = mongoCollectionName;
     this.ocrQueueCollectionName = ocrQueueCollectionName;
     this.accountId = accountId;
+    this.transcriptFullRetentionDays = Number.isFinite(Number(transcriptFullRetentionDays))
+      ? Math.max(0, Number(transcriptFullRetentionDays))
+      : 1;
+    this.transcriptRetentionDays = Number.isFinite(Number(transcriptRetentionDays))
+      ? Math.max(this.transcriptFullRetentionDays, Number(transcriptRetentionDays))
+      : 7;
     this.useMongo = Boolean(mongoUri);
     this.mongoClient = null;
     this.mongoCollection = null;
@@ -70,6 +126,7 @@ export class Store {
           messages: doc.messages || {},
           credentials: doc.credentials || null,
         };
+        if (this.pruneMessageHistory()) await this.save();
       } else {
         await this.save();
       }
@@ -92,6 +149,7 @@ export class Store {
       this.state.topics ||= {};
       this.state.messages ||= {};
       this.state.credentials ||= null;
+      if (this.pruneMessageHistory()) await this.save();
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
       await this.save();
@@ -194,6 +252,7 @@ export class Store {
   }
 
   async appendMessage(conversationId, message) {
+    this.pruneMessageHistory();
     const key = String(conversationId);
     const items = this.state.messages[key] || [];
     const messageId = String(message.id || '');
@@ -208,28 +267,107 @@ export class Store {
       id: message.id || crypto.randomUUID(),
       direction: message.direction || 'in',
       source: message.source || 'zalo',
-      senderName: message.senderName || '',
-      text: message.text || '',
-      attachment: message.attachment || null,
+      senderName: boundedString(message.senderName, 160),
+      text: boundedUtf8String(message.text, MAX_STORED_TEXT_BYTES),
+      attachment: storedAttachment(message.attachment),
       createdAt: message.createdAt || new Date().toISOString(),
       topicId: message.topicId ?? null,
       threadType: message.threadType ?? null,
       telegramMessageId: message.telegramMessageId ? Number(message.telegramMessageId) : null,
-      replyData: message.replyData ? structuredClone(message.replyData) : null,
+      replyData: storedQuoteData(message.replyData),
     };
 
     items.push(entry);
-    this.state.messages[key] = items.slice(-500);
+    this.state.messages[key] = items.slice(-MAX_MESSAGES_PER_CONVERSATION);
+    this.pruneMessageHistory();
 
     const conversation = this.state.conversations[key];
     if (conversation) {
       conversation.updatedAt = entry.createdAt;
-      conversation.lastMessage = entry.text || entry.attachment?.title || '(attachment)';
+      conversation.lastMessage = boundedUtf8String(
+        entry.text || entry.attachment?.title || '(attachment)',
+        512,
+      );
       conversation.lastDirection = entry.direction;
     }
 
     await this.save();
     return entry;
+  }
+
+  pruneMessageHistory(now = Date.now()) {
+    const fullRetentionMs = this.transcriptFullRetentionDays * DAY_MS;
+    const retentionMs = Math.max(fullRetentionMs, this.transcriptRetentionDays * DAY_MS);
+    const entries = [];
+    let changed = false;
+
+    for (const [conversationId, messages] of Object.entries(this.state.messages || {})) {
+      if (!Array.isArray(messages)) {
+        delete this.state.messages[conversationId];
+        changed = true;
+        continue;
+      }
+      const kept = [];
+      for (const message of messages) {
+        const createdAt = messageTimestamp(message);
+        const age = createdAt ? Math.max(0, now - createdAt) : 0;
+        if (createdAt && age >= retentionMs) {
+          changed = true;
+          continue;
+        }
+
+        const retainedFull = {
+          id: boundedString(message.id, 160),
+          direction: boundedString(message.direction, 16),
+          source: boundedString(message.source, 32),
+          senderName: boundedString(message.senderName, 160),
+          text: boundedUtf8String(message.text, MAX_STORED_TEXT_BYTES),
+          attachment: storedAttachment(message.attachment),
+          createdAt: message.createdAt || new Date(createdAt || now).toISOString(),
+          topicId: message.topicId ?? null,
+          threadType: message.threadType ?? null,
+          ...(message.telegramMessageId ? { telegramMessageId: Number(message.telegramMessageId) } : {}),
+          ...(message.replyData ? { replyData: storedQuoteData(message.replyData) } : {}),
+        };
+        let retained = retainedFull;
+        if (createdAt && age >= fullRetentionMs) {
+          retained = {
+            id: retainedFull.id,
+            createdAt: retainedFull.createdAt,
+            ...(retainedFull.telegramMessageId ? { telegramMessageId: retainedFull.telegramMessageId } : {}),
+            ...(retainedFull.replyData ? { replyData: retainedFull.replyData } : {}),
+          };
+        }
+        if (JSON.stringify(retained) !== JSON.stringify(message)) changed = true;
+        kept.push(retained);
+        entries.push({ conversationId, message: retained, createdAt });
+      }
+      this.state.messages[conversationId] = kept;
+    }
+
+    entries.sort((a, b) => b.createdAt - a.createdAt);
+    const retainedEntries = new Set(entries.slice(0, MAX_MESSAGES_PER_ACCOUNT).map((entry) => entry.message));
+    if (entries.length > MAX_MESSAGES_PER_ACCOUNT) changed = true;
+    for (const [conversationId, messages] of Object.entries(this.state.messages)) {
+      const kept = messages.filter((message) => retainedEntries.has(message));
+      if (kept.length !== messages.length) {
+        this.state.messages[conversationId] = kept;
+        changed = true;
+      }
+      if (kept.length === 0) delete this.state.messages[conversationId];
+    }
+    for (const conversation of Object.values(this.state.conversations || {})) {
+      const updatedAt = Date.parse(conversation?.updatedAt || '');
+      if (
+        conversation?.lastMessage &&
+        Number.isFinite(updatedAt) &&
+        now - updatedAt >= fullRetentionMs
+      ) {
+        conversation.lastMessage = '';
+        changed = true;
+      }
+    }
+    return changed;
   }
 
   getReplyData(telegramMessageId) {

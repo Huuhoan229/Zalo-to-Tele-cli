@@ -35,6 +35,12 @@ function parsePort(value, fallback) {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function parsePositiveNumber(value, fallback) {
+  if (value === undefined || value === null || String(value).trim() === '') return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 export const config = {
   rootDir,
   telegramBotToken: required('TELEGRAM_BOT_TOKEN'),
@@ -46,6 +52,8 @@ export const config = {
   mongoDbName: process.env.MONGODB_DB_NAME?.trim() || 'zalo-to-tele',
   mongoCollectionName: process.env.MONGODB_COLLECTION_NAME?.trim() || 'bridge_state',
   ocrQueueCollectionName: process.env.MONGODB_QUEUE_COLLECTION_NAME?.trim() || 'ocr_queue',
+  transcriptFullRetentionDays: parsePositiveNumber(process.env.TRANSCRIPT_FULL_RETENTION_DAYS, 1),
+  transcriptRetentionDays: parsePositiveNumber(process.env.TRANSCRIPT_RETENTION_DAYS, 7),
   zaloCredentialsFile: optionalPath('ZALO_CREDENTIALS_FILE', 'sessions/zalo-credentials.json'),
   dataFile: optionalPath('DATA_FILE', 'data/store.json'),
   downloadDir: optionalPath('DOWNLOAD_DIR', 'downloads'),
