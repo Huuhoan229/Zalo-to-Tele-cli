@@ -12,6 +12,7 @@ Bridge one or more personal Zalo accounts to one Telegram forum group.
 - Supports multiple Zalo accounts with one Telegram bot and one Telegram forum group.
 - Stores Zalo sessions and Telegram topic mappings in MongoDB, so Render redeploys do not wipe the bridge state.
 - Queues matched Zalo messages into MongoDB for a separate local OCR worker.
+- Provides a private Telegram management menu for AI chat, Zalo QR login, status, and AI auto-reply mode.
 
 ## Message Flow
 
@@ -212,7 +213,12 @@ Set the required Render environment variables:
 ```env
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_FORUM_CHAT_ID=-100...
+TELEGRAM_ADMIN_IDS=123456789
 WEB_ACCESS_TOKEN=choose_a_private_token
+
+AI_BASE_URL=https://your-9router-service.onrender.com/v1
+AI_API_KEY=your_9router_api_key
+AI_MODEL=your_model_or_combo
 
 MONGODB_URI=mongodb+srv://user:password@cluster0.example.mongodb.net/?retryWrites=true&w=majority
 MONGODB_DB_NAME=zalo-to-tele
@@ -291,6 +297,36 @@ If `WEB_ACCESS_TOKEN` is set, open URLs with `?token=YOUR_TOKEN` or send it as a
 
 - `/id` shows `chat_id`, `message_thread_id`, and sender ID.
 - `/topics` lists mapped Telegram topics and Zalo conversations.
+- `/menu` opens the private management menu.
+- `/allowai <telegram_user_id>`, `/denyai <telegram_user_id>`, `/aiusers` manage AI-only Telegram access.
+- `/zaloqr [account_id]`, `/addzalo [label]`, `/zaloaccounts`, `/zalostart <account_id>`, and `/zalostop <account_id>` manage Zalo accounts.
+- `/zaloai off|command|dm|all [account_id]` controls AI auto-replies for one account.
+
+## Telegram Management Menu and AI
+
+Open a private chat with the bot and use `/start` or `/menu`. The menu provides:
+
+- `Chat với AI`: sends questions to an OpenAI-compatible endpoint, including a 9Router deployment.
+- `Kết nối Zalo`: starts QR login for the configured Zalo account.
+- `Bật/tắt AI Zalo`: opens the account list; each account has an AI toggle between `dm` and `off`.
+- `Trạng thái`: shows the Zalo listener and current AI mode.
+
+Set `TELEGRAM_ADMIN_IDS` to the administrator Telegram ID(s). Use `/id` to look up an ID, then add it in Render's Environment settings and redeploy. Admins can grant AI-only access to other IDs with `/allowai <telegram_user_id>`, revoke it with `/denyai <telegram_user_id>`, and list it with `/aiusers`. `ALLOWED_TELEGRAM_USER_IDS` still controls who can send messages from Telegram topics back to Zalo; keep these two lists separate if needed.
+
+Configure the AI service with:
+
+```env
+AI_BASE_URL=https://your-9router-service.example.com/v1
+AI_API_KEY=your_9router_api_key
+AI_MODEL=your_model_or_combo
+AI_SYSTEM_PROMPT=Bạn là trợ lý hữu ích. Trả lời bằng ngôn ngữ người dùng sử dụng.
+```
+
+The bot supports `/ask <câu hỏi>` and `/zaloai off|command|dm|all [account_id]`. In `command` mode, Zalo replies require `/ask`, `/ai`, or an explicit group mention; `dm` also replies to private chats; `all` replies to all incoming text messages and images. AI defaults to `off` for each Zalo account. Image analysis requires a model with vision support. AI chat history and AI access permissions are stored in a dedicated MongoDB control record; each account's Zalo AI mode stays with that account's bridge record.
+
+### Keep the two Render deployments
+
+The bridge and 9Router can remain separate Render services. Set `AI_BASE_URL` to the 9Router service URL ending in `/v1`, then set its API key and model in the bridge service. Keep the Telegram bot token only in this bridge service. To use the 9Router service only as the AI API, remove `TELEGRAM_BOT_TOKEN` from its Environment settings; this prevents two services polling updates for the same bot. The 9Router service can keep its existing GitHub Gist backup for its SQLite data.
 
 ## OCR Queue
 

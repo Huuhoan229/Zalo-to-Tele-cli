@@ -2,7 +2,7 @@ import pino from 'pino';
 import { config } from './config.js';
 import { BridgeManager } from './bridgeManager.js';
 import { startWebServer } from './webServer.js';
-import { webhookHandlers } from './telegramBot.js';
+import { webhookHandlers, startTelegramControlBot, stopTelegramControlBot } from './telegramBot.js';
 
 const logger = pino({
   level: config.logLevel,
@@ -70,8 +70,11 @@ async function main() {
     onRemoveAccount: (id) => manager.removeAccount(id),
   });
 
+  const telegramControl = await startTelegramControlBot({ config, manager, logger });
+
   async function shutdown(reason) {
     await manager.stopAll(reason);
+    stopTelegramControlBot(telegramControl, reason);
     webServer.close();
   }
 

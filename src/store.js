@@ -9,6 +9,7 @@ const EMPTY_STATE = {
   topics: {},
   messages: {},
   credentials: null,
+  ai: { zaloMode: 'off', telegramHistory: {}, zaloHistory: {}, allowedTelegramUserIds: [] },
 };
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MAX_MESSAGES_PER_CONVERSATION = 500;
@@ -125,6 +126,7 @@ export class Store {
           topics: doc.topics || {},
           messages: doc.messages || {},
           credentials: doc.credentials || null,
+          ai: { ...EMPTY_STATE.ai, ...(doc.ai || {}) },
         };
         if (this.pruneMessageHistory()) await this.save();
       } else {
@@ -144,6 +146,7 @@ export class Store {
         topics: parsed.topics || {},
         messages: parsed.messages || {},
         credentials: parsed.credentials || null,
+        ai: { ...EMPTY_STATE.ai, ...(parsed.ai || {}) },
       };
       this.state.conversations ||= {};
       this.state.topics ||= {};
@@ -229,6 +232,84 @@ export class Store {
     this.state.credentials = credentials ? structuredClone(credentials) : null;
     await this.save();
     return this.state.credentials;
+  }
+
+  getZaloAiMode() {
+    return this.state.ai?.zaloMode || 'off';
+  }
+
+  async setZaloAiMode(mode) {
+    this.state.ai ||= structuredClone(EMPTY_STATE.ai);
+    this.state.ai.zaloMode = mode;
+    await this.save();
+    return mode;
+  }
+
+  getTelegramAiHistory(userId) {
+    this.state.ai ||= structuredClone(EMPTY_STATE.ai);
+    return structuredClone(this.state.ai.telegramHistory?.[String(userId)] || []);
+  }
+
+  async appendTelegramAiTurn(userId, userText, assistantText) {
+    this.state.ai ||= structuredClone(EMPTY_STATE.ai);
+    this.state.ai.telegramHistory ||= {};
+    const key = String(userId);
+    const history = this.state.ai.telegramHistory[key] || [];
+    history.push(
+      { role: 'user', content: String(userText || '').slice(0, 4000) },
+      { role: 'assistant', content: String(assistantText || '').slice(0, 4000) },
+    );
+    this.state.ai.telegramHistory[key] = history.slice(-20);
+    await this.save();
+  }
+
+  async clearTelegramAiHistory(userId) {
+    this.state.ai ||= structuredClone(EMPTY_STATE.ai);
+    this.state.ai.telegramHistory ||= {};
+    delete this.state.ai.telegramHistory[String(userId)];
+    await this.save();
+  }
+
+  getAllowedTelegramAiUsers() {
+    this.state.ai ||= structuredClone(EMPTY_STATE.ai);
+    return [...new Set((this.state.ai.allowedTelegramUserIds || []).map(Number).filter(Number.isSafeInteger))];
+  }
+
+  async setTelegramAiUserAllowed(userId, allowed) {
+    const numericId = Number(userId);
+    if (!Number.isSafeInteger(numericId) || numericId <= 0) throw new Error('Telegram ID phải là số hợp lệ.');
+    this.state.ai ||= structuredClone(EMPTY_STATE.ai);
+    const current = new Set(this.getAllowedTelegramAiUsers());
+    if (allowed) current.add(numericId);
+    else current.delete(numericId);
+    this.state.ai.allowedTelegramUserIds = [...current];
+    await this.save();
+    return [...current];
+  }
+
+  getZaloAiHistory(conversationId) {
+    this.state.ai ||= structuredClone(EMPTY_STATE.ai);
+    return structuredClone(this.state.ai.zaloHistory?.[String(conversationId)] || []);
+  }
+
+  async appendZaloAiTurn(conversationId, userText, assistantText) {
+    this.state.ai ||= structuredClone(EMPTY_STATE.ai);
+    this.state.ai.zaloHistory ||= {};
+    const key = String(conversationId);
+    const history = this.state.ai.zaloHistory[key] || [];
+    history.push(
+      { role: 'user', content: String(userText || '').slice(0, 4000) },
+      { role: 'assistant', content: String(assistantText || '').slice(0, 4000) },
+    );
+    this.state.ai.zaloHistory[key] = history.slice(-12);
+    await this.save();
+  }
+
+  async clearZaloAiHistory(conversationId) {
+    this.state.ai ||= structuredClone(EMPTY_STATE.ai);
+    this.state.ai.zaloHistory ||= {};
+    delete this.state.ai.zaloHistory[String(conversationId)];
+    await this.save();
   }
 
   async upsertMapping(mapping) {

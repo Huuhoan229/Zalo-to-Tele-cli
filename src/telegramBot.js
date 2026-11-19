@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { Input, Telegraf } from 'telegraf';
+import { Input, Markup, Telegraf } from 'telegraf';
 import { message } from 'telegraf/filters';
 import fs from 'node:fs/promises';
 import { ensureDir, uniqueDownloadPath } from './media.js';
@@ -12,6 +12,33 @@ const runtimes = new Map();
  * Exported so cli.js can pass it to startWebServer().
  */
 export const webhookHandlers = new Map();
+
+const MANAGEMENT_MENU = Markup.keyboard([
+  ['💬 Chat với AI', '🔗 Kết nối Zalo'],
+  ['➕ Thêm tài khoản Zalo', '📋 Tài khoản Zalo'],
+  ['🤖 Bật/tắt AI Zalo', '📊 Trạng thái'],
+  ['🔐 Quyền chat AI'],
+  ['🧹 Xóa lịch sử AI'],
+]).resize();
+const AI_USER_MENU = Markup.keyboard([['💬 Chat với AI'], ['🧹 Xóa lịch sử AI']]).resize();
+
+function splitTelegramText(value, maxLength = 4000) {
+  const text = String(value || '');
+  const chunks = [];
+  for (let offset = 0; offset < text.length; offset += maxLength) chunks.push(text.slice(offset, offset + maxLength));
+  return chunks.length ? chunks : [''];
+}
+
+async function telegramPhotoDataUrl(ctx) {
+  const photo = ctx.message?.photo?.at(-1);
+  if (!photo) throw new Error('Không tìm thấy ảnh Telegram.');
+  const link = await ctx.telegram.getFileLink(photo.file_id);
+  const response = await fetch(link);
+  if (!response.ok) throw new Error(`Không tải được ảnh Telegram: HTTP ${response.status}`);
+  const mime = response.headers.get('content-type') || 'image/jpeg';
+  const buffer = Buffer.from(await response.arrayBuffer());
+  return `data:${mime};base64,${buffer.toString('base64')}`;
+}
 
 function webhookPathForToken(token) {
   // Derive a secret path from the bot token so random HTTP clients can't
@@ -77,6 +104,8 @@ class SharedTelegramRuntime {
     this.startingPromise = null;
     this.processedUpdates = new Map();
     this.inFlightUpdates = new Set();
+    this.manager = null;
+    this.controlStarted = false;
     // Webhook mode: đọc TELEGRAM_WEBHOOK_URL từ env (setting toàn deployment).
     // Nếu không set → fallback về long polling (chạy local).
     const webhookBaseUrl = process.env.TELEGRAM_WEBHOOK_URL?.trim().replace(/\/$/, '') || '';
@@ -105,7 +134,7 @@ class SharedTelegramRuntime {
 
   removeBridge(bridge, reason = 'manual') {
     this.bridges.delete(bridge);
-    if (this.bridges.size === 0 && this.started) {
+    if (this.bridges.size === 0 && this.started && !this.controlStarted) {
       if (this.isWebhookMode) {
         // Xoá webhook handler khỏi registry và notify Telegram xoá webhook.
         webhookHandlers.delete(this.webhookPath);
@@ -132,6 +161,24 @@ class SharedTelegramRuntime {
         await this.bot.telegram.setWebhook(fullUrl);
         webhookHandlers.set(this.webhookPath, this.bot.webhookCallback(this.webhookPath));
         this.started = true;
+        this.bot.telegram.setMyCommands([
+          { command: 'start', description: 'Mở menu quản lý bot' },
+          { command: 'menu', description: 'Hiện menu chức năng' },
+          { command: 'ask', description: 'Hỏi AI: /ask câu hỏi' },
+          { command: 'clear', description: 'Xóa lịch sử chat AI của bạn' },
+          { command: 'zaloqr', description: 'Kết nối tài khoản Zalo bằng QR' },
+          { command: 'addzalo', description: 'Thêm tài khoản Zalo mới' },
+          { command: 'zaloaccounts', description: 'Quản lý tài khoản Zalo' },
+          { command: 'zalostart', description: 'Khởi động tài khoản Zalo' },
+          { command: 'zalostop', description: 'Dừng tài khoản Zalo' },
+          { command: 'zalostatus', description: 'Xem trạng thái Zalo và AI' },
+          { command: 'zaloai', description: 'Chế độ AI Zalo: off/command/dm/all' },
+          { command: 'allowai', description: 'Cấp quyền chat AI cho Telegram ID' },
+          { command: 'denyai', description: 'Thu hồi quyền chat AI của Telegram ID' },
+          { command: 'aiusers', description: 'Liệt kê ID được phép chat AI' },
+          { command: 'topics', description: 'Liệt kê topic Zalo đã liên kết' },
+          { command: 'id', description: 'Xem Telegram ID' },
+        ]).catch((error) => this.logger.warn({ error }, 'Could not register Telegram command menu.'));
         this.logger.info({ url: fullUrl }, 'Telegram webhook registered.');
         return;
       }
@@ -146,6 +193,24 @@ class SharedTelegramRuntime {
       // Telegraf's polling launch promise can stay pending for the bot lifetime.
       // Mark the runtime started before launching and observe failures separately.
       this.started = true;
+      this.bot.telegram.setMyCommands([
+        { command: 'start', description: 'Mở menu quản lý bot' },
+        { command: 'menu', description: 'Hiện menu chức năng' },
+        { command: 'ask', description: 'Hỏi AI: /ask câu hỏi' },
+        { command: 'clear', description: 'Xóa lịch sử chat AI của bạn' },
+        { command: 'zaloqr', description: 'Kết nối tài khoản Zalo bằng QR' },
+        { command: 'addzalo', description: 'Thêm tài khoản Zalo mới' },
+        { command: 'zaloaccounts', description: 'Quản lý tài khoản Zalo' },
+        { command: 'zalostart', description: 'Khởi động tài khoản Zalo' },
+        { command: 'zalostop', description: 'Dừng tài khoản Zalo' },
+        { command: 'zalostatus', description: 'Xem trạng thái Zalo và AI' },
+        { command: 'zaloai', description: 'Chế độ AI Zalo: off/command/dm/all' },
+        { command: 'allowai', description: 'Cấp quyền chat AI cho Telegram ID' },
+        { command: 'denyai', description: 'Thu hồi quyền chat AI của Telegram ID' },
+        { command: 'aiusers', description: 'Liệt kê ID được phép chat AI' },
+        { command: 'topics', description: 'Liệt kê topic Zalo đã liên kết' },
+        { command: 'id', description: 'Xem Telegram ID' },
+      ]).catch((error) => this.logger.warn({ error }, 'Could not register Telegram command menu.'));
       this.bot.launch().catch((err) => {
         this.started = false;
         this.logger.error({ err }, 'Telegram polling stopped with error.');
@@ -170,6 +235,267 @@ class SharedTelegramRuntime {
     if (this.handlersRegistered) return;
     this.handlersRegistered = true;
 
+    const isAdmin = (ctx) => this.config.telegramAdminIds?.has(Number(ctx.from?.id)) || false;
+    const isAiUser = async (ctx) => isAdmin(ctx) || Boolean(await this.manager?.isAiUserAllowed(ctx.from?.id));
+    const deny = async (ctx) => {
+      await ctx.reply(`⛔ Chưa được cấp quyền quản lý. Telegram ID của bạn: ${ctx.from?.id || '(không rõ)'}`);
+    };
+    const showMenu = async (ctx, text = 'Chọn chức năng:') => {
+      await ctx.reply(text, isAdmin(ctx) ? MANAGEMENT_MENU : AI_USER_MENU);
+    };
+    const sendQr = async (chatId, image) => {
+      if (!image) return;
+      const raw = String(image).replace(/^data:image\/\w+;base64,/, '');
+      await this.bot.telegram.sendPhoto(chatId, Input.fromBuffer(Buffer.from(raw, 'base64'), 'zalo-qr.png'), {
+        caption: 'Quét QR bằng ứng dụng Zalo trên điện thoại để kết nối tài khoản.',
+      });
+    };
+    const requireAdmin = async (ctx, action) => {
+      if (!isAdmin(ctx)) return deny(ctx);
+      if (ctx.chat?.type !== 'private') {
+        await ctx.reply('Mở chat riêng với bot để dùng chức năng quản lý.');
+        return;
+      }
+      return action();
+    };
+    const startQr = async (ctx) => {
+      await requireAdmin(ctx, async () => {
+        if (!this.manager) return ctx.reply('Quản lý Zalo chưa khởi động.');
+        await ctx.reply('Đang tạo phiên QR Zalo. Bot sẽ gửi mã tại đây khi sẵn sàng.');
+        try {
+          const text = ctx.message?.text?.trim() || '';
+          const accountId = /^\/zaloqr(?:@\w+)?(?:\s|$)/i.test(text)
+            ? text.split(/\s+/)[1] || null
+            : null;
+          await this.manager.requestZaloQr((image) => sendQr(ctx.chat.id, image), accountId);
+        } catch (error) {
+          await ctx.reply(`Không khởi tạo được QR Zalo: ${humanError(error)}`);
+        }
+      });
+    };
+    const showStatus = async (ctx) => {
+      await requireAdmin(ctx, async () => {
+        const accounts = this.manager ? await this.manager.listAccounts() : [];
+        const lines = accounts.length
+          ? (await Promise.all(accounts.map(async (account) => {
+              const mode = await this.manager.getZaloAiMode(account.id);
+              return `• ${account.label} [${account.id}]: ${account.status}${account.listenerConnected ? ' (đang nghe tin)' : ''} · AI ${mode}`;
+            }))).join('\n')
+          : 'Chưa có tài khoản Zalo.';
+        await showMenu(ctx, `📊 Trạng thái tài khoản\n${lines}`);
+      });
+    };
+    const setAiMode = async (ctx, mode, accountId = null) => {
+      await requireAdmin(ctx, async () => {
+        if (!this.manager) return ctx.reply('Quản lý Zalo chưa khởi động.');
+        try {
+          const result = await this.manager.setZaloAiMode(mode, accountId);
+          await showMenu(ctx, `Đã đặt AI Zalo ${accountId ? `cho ${accountId}` : ''}: ${result}`);
+        } catch (error) {
+          await ctx.reply(`Không đổi được chế độ AI Zalo: ${humanError(error)}`);
+        }
+      });
+    };
+    const addZaloAccount = async (ctx, label = 'Zalo') => {
+      await requireAdmin(ctx, async () => {
+        if (!this.manager) return ctx.reply('Quản lý Zalo chưa khởi động.');
+        await ctx.reply('Đang tạo tài khoản Zalo mới, QR sẽ được gửi vào đây khi sẵn sàng.');
+        try {
+          const account = await this.manager.addZaloAccount(label, (image) => sendQr(ctx.chat.id, image));
+          await ctx.reply(`Đã tạo tài khoản ${account.label} (${account.id}). Quét QR vừa được gửi để đăng nhập.`);
+        } catch (error) {
+          await ctx.reply(`Không tạo được tài khoản Zalo: ${humanError(error)}`);
+        }
+      });
+    };
+    const showAccounts = async (ctx) => {
+      await requireAdmin(ctx, async () => {
+        const accounts = this.manager ? await this.manager.listAccounts() : [];
+        if (!accounts.length) return showMenu(ctx, 'Chưa có tài khoản Zalo. Chọn “Thêm tài khoản Zalo”.');
+        const rows = accounts.map((account) => [
+          Markup.button.callback(`${account.label} · ${account.status}`, `zalo:account:${account.id}`),
+        ]);
+        rows.push([Markup.button.callback('➕ Thêm tài khoản', 'zalo:add')]);
+        await ctx.reply('Chọn tài khoản Zalo để quản lý:', Markup.inlineKeyboard(rows));
+      });
+    };
+    const showAiUsers = async (ctx) => {
+      await requireAdmin(ctx, async () => {
+        const users = await this.manager.listAiUsers();
+        await showMenu(ctx, `🔐 Quyền chat AI\nID được cấp: ${users.join(', ') || '(chưa có)'}\n\nDùng /allowai <telegram_user_id> để cấp.\nDùng /denyai <telegram_user_id> để thu hồi.`);
+      });
+    };
+
+    this.bot.command(['start', 'menu', 'help'], async (ctx) => {
+      if (!(await isAiUser(ctx))) return deny(ctx);
+      if (ctx.chat?.type !== 'private') return ctx.reply('Mở chat riêng với bot để dùng menu.');
+      return showMenu(ctx);
+    });
+    this.bot.command('ask', async (ctx) => {
+      if (!(await isAiUser(ctx))) return deny(ctx);
+      if (ctx.chat?.type !== 'private') return ctx.reply('Dùng /ask trong chat riêng với bot.');
+      const prompt = ctx.message.text.replace(/^\/ask(?:@[\w]+)?\s*/i, '').trim();
+      if (!prompt) return showMenu(ctx, 'Dùng /ask kèm câu hỏi hoặc gửi thẳng câu hỏi trong chat riêng.');
+      if (!this.manager) return ctx.reply('Bot quản lý chưa sẵn sàng.');
+      try {
+        await ctx.sendChatAction('typing');
+        const answer = await this.manager.chatWithAi(ctx.from.id, prompt);
+        for (const part of splitTelegramText(answer)) await ctx.reply(part, isAdmin(ctx) ? MANAGEMENT_MENU : AI_USER_MENU);
+      } catch (error) {
+        await ctx.reply(`Không gọi được AI: ${humanError(error)}`, isAdmin(ctx) ? MANAGEMENT_MENU : AI_USER_MENU);
+      }
+    });
+    this.bot.command('clear', async (ctx) => {
+      if (!(await isAiUser(ctx))) return deny(ctx);
+      try {
+        await this.manager?.clearAiHistory(ctx.from.id);
+        await ctx.reply('Đã xóa lịch sử chat AI.', isAdmin(ctx) ? MANAGEMENT_MENU : AI_USER_MENU);
+      } catch (error) {
+        await ctx.reply(`Không xóa được lịch sử: ${humanError(error)}`);
+      }
+    });
+    this.bot.command('zaloqr', startQr);
+    this.bot.command('addzalo', (ctx) => addZaloAccount(ctx, ctx.message.text.replace(/^\/addzalo(?:@[\w]+)?\s*/i, '').trim() || 'Zalo'));
+    this.bot.command('zalostatus', showStatus);
+    this.bot.command('zaloaccounts', showAccounts);
+    this.bot.command('zalostart', async (ctx) => {
+      if (!isAdmin(ctx)) return deny(ctx);
+      if (ctx.chat?.type !== 'private') return ctx.reply('Dùng lệnh này trong chat riêng với bot.');
+      const id = ctx.message.text.split(/\s+/)[1];
+      if (!id) return ctx.reply('Dùng /zalostart <account_id>');
+      try { await this.manager.startManagedAccount(id); await showStatus(ctx); }
+      catch (error) { await ctx.reply(`Không khởi động được tài khoản: ${humanError(error)}`); }
+    });
+    this.bot.command('zalostop', async (ctx) => {
+      if (!isAdmin(ctx)) return deny(ctx);
+      if (ctx.chat?.type !== 'private') return ctx.reply('Dùng lệnh này trong chat riêng với bot.');
+      const id = ctx.message.text.split(/\s+/)[1];
+      if (!id) return ctx.reply('Dùng /zalostop <account_id>');
+      try { await this.manager.stopManagedAccount(id); await showStatus(ctx); }
+      catch (error) { await ctx.reply(`Không dừng được tài khoản: ${humanError(error)}`); }
+    });
+    this.bot.action('zalo:add', async (ctx) => {
+      if (!isAdmin(ctx) || ctx.chat?.type !== 'private') return ctx.answerCbQuery('Chỉ admin được dùng trong chat riêng với bot.');
+      await ctx.answerCbQuery();
+      await addZaloAccount(ctx, 'Zalo');
+    });
+    this.bot.action(/^zalo:account:(.+)$/, async (ctx) => {
+      if (!isAdmin(ctx) || ctx.chat?.type !== 'private') return ctx.answerCbQuery('Chỉ admin được dùng trong chat riêng với bot.');
+      await ctx.answerCbQuery();
+      const id = ctx.match[1];
+      const account = this.manager?.getAccount(id);
+      if (!account) return ctx.reply('Không tìm thấy tài khoản này.');
+      const rows = [
+        [Markup.button.callback('🔄 Quét lại QR', `zalo:qr:${id}`)],
+        [Markup.button.callback('▶️ Bật', `zalo:start:${id}`), Markup.button.callback('⏸ Tắt', `zalo:stop:${id}`)],
+        [Markup.button.callback('🤖 Bật/tắt AI', `zalo:ai:${id}`)],
+      ];
+      await ctx.reply(`${account.label} (${id})`, Markup.inlineKeyboard(rows));
+    });
+    this.bot.action(/^zalo:qr:(.+)$/, async (ctx) => {
+      if (!isAdmin(ctx) || ctx.chat?.type !== 'private') return ctx.answerCbQuery('Chỉ admin được dùng trong chat riêng với bot.');
+      await ctx.answerCbQuery();
+      try {
+        await ctx.reply('Đang yêu cầu QR đăng nhập lại.');
+        await this.manager.requestZaloQr((image) => sendQr(ctx.chat.id, image), ctx.match[1]);
+      } catch (error) { await ctx.reply(`Không tạo được QR: ${humanError(error)}`); }
+    });
+    for (const operation of ['start', 'stop']) {
+      this.bot.action(new RegExp(`^zalo:${operation}:(.+)$`), async (ctx) => {
+        if (!isAdmin(ctx) || ctx.chat?.type !== 'private') return ctx.answerCbQuery('Chỉ admin được dùng trong chat riêng với bot.');
+        await ctx.answerCbQuery();
+        try {
+          if (operation === 'start') await this.manager.startManagedAccount(ctx.match[1]);
+          else await this.manager.stopManagedAccount(ctx.match[1]);
+          await showStatus(ctx);
+        } catch (error) { await ctx.reply(`Không cập nhật được tài khoản: ${humanError(error)}`); }
+      });
+    }
+    this.bot.action(/^zalo:ai:(.+)$/, async (ctx) => {
+      if (!isAdmin(ctx) || ctx.chat?.type !== 'private') return ctx.answerCbQuery('Chỉ admin được dùng trong chat riêng với bot.');
+      await ctx.answerCbQuery();
+      try {
+        const id = ctx.match[1];
+        const current = await this.manager.getZaloAiMode(id);
+        const next = current === 'off' ? 'dm' : 'off';
+        await this.manager.setZaloAiMode(next, id);
+        await ctx.reply(`AI Zalo cho ${id}: ${next}`);
+      } catch (error) { await ctx.reply(`Không đổi được chế độ AI: ${humanError(error)}`); }
+    });
+    this.bot.command('zaloai', async (ctx) => {
+      if (!isAdmin(ctx)) return deny(ctx);
+      if (ctx.chat?.type !== 'private') return ctx.reply('Dùng lệnh này trong chat riêng với bot.');
+      const [, modeArg, accountId] = ctx.message.text.split(/\s+/);
+      const mode = modeArg?.toLowerCase();
+      if (!mode) return showStatus(ctx);
+      if (!['off', 'command', 'dm', 'all'].includes(mode)) {
+        return ctx.reply('Dùng /zaloai off|command|dm|all [account_id]');
+      }
+      await setAiMode(ctx, mode, accountId || null);
+    });
+    this.bot.command('allowai', async (ctx) => {
+      if (!isAdmin(ctx)) return deny(ctx);
+      if (ctx.chat?.type !== 'private') return ctx.reply('Dùng lệnh này trong chat riêng với bot.');
+      const id = ctx.message.text.split(/\s+/)[1];
+      if (!id) return ctx.reply('Dùng /allowai <telegram_user_id>');
+      try {
+        const users = await this.manager.setAiUserAllowed(id, true);
+        await ctx.reply(`Đã cấp quyền chat AI cho ${id}. Danh sách: ${users.join(', ')}`);
+      } catch (error) {
+        await ctx.reply(`Không cấp được quyền: ${humanError(error)}`);
+      }
+    });
+    this.bot.command('denyai', async (ctx) => {
+      if (!isAdmin(ctx)) return deny(ctx);
+      if (ctx.chat?.type !== 'private') return ctx.reply('Dùng lệnh này trong chat riêng với bot.');
+      const id = ctx.message.text.split(/\s+/)[1];
+      if (!id) return ctx.reply('Dùng /denyai <telegram_user_id>');
+      try {
+        const users = await this.manager.setAiUserAllowed(id, false);
+        await ctx.reply(`Đã thu hồi quyền chat AI cho ${id}. Danh sách: ${users.join(', ') || '(trống)'}`);
+      } catch (error) {
+        await ctx.reply(`Không thu hồi được quyền: ${humanError(error)}`);
+      }
+    });
+    this.bot.command('aiusers', async (ctx) => {
+      if (!isAdmin(ctx)) return deny(ctx);
+      if (ctx.chat?.type !== 'private') return ctx.reply('Dùng lệnh này trong chat riêng với bot.');
+      const users = await this.manager.listAiUsers();
+      await ctx.reply(`ID được cấp quyền chat AI: ${users.join(', ') || '(chưa có)'}\nAdmin env: ${[...(this.config.telegramAdminIds || [])].join(', ') || '(chưa cấu hình)'}`);
+    });
+
+    this.bot.on(message('text'), async (ctx, next) => {
+      if (ctx.chat?.type !== 'private') return next();
+      const text = String(ctx.message.text || '').trim();
+      if (text.startsWith('/')) return next();
+      if (!(await isAiUser(ctx))) return deny(ctx);
+      if (text === '🔗 Kết nối Zalo') return startQr(ctx);
+      if (text === '➕ Thêm tài khoản Zalo') return addZaloAccount(ctx);
+      if (text === '📋 Tài khoản Zalo') return showAccounts(ctx);
+      if (text === '📊 Trạng thái') return showStatus(ctx);
+      if (text === '🤖 Bật/tắt AI Zalo') {
+        return showAccounts(ctx);
+      }
+      if (text === '🔐 Quyền chat AI') return showAiUsers(ctx);
+      if (text === '🧹 Xóa lịch sử AI') {
+        try {
+          await this.manager?.clearAiHistory(ctx.from.id);
+          return showMenu(ctx, 'Đã xóa lịch sử chat AI của bạn.');
+        } catch (error) {
+          return ctx.reply(`Không xóa được lịch sử: ${humanError(error)}`);
+        }
+      }
+      if (text === '💬 Chat với AI') return showMenu(ctx, 'Gửi câu hỏi tiếp theo trong chat này để trò chuyện với AI.');
+      try {
+        if (!this.manager) return showMenu(ctx, 'Bot quản lý chưa sẵn sàng.');
+        await ctx.sendChatAction('typing');
+        const answer = await this.manager.chatWithAi(ctx.from.id, text);
+        for (const part of splitTelegramText(answer)) await ctx.reply(part, isAdmin(ctx) ? MANAGEMENT_MENU : AI_USER_MENU);
+      } catch (error) {
+        await ctx.reply(`Không gọi được AI: ${humanError(error)}`, isAdmin(ctx) ? MANAGEMENT_MENU : AI_USER_MENU);
+      }
+    });
+
     this.bot.command('id', async (ctx) => {
       await ctx.reply(
         [
@@ -181,6 +507,7 @@ class SharedTelegramRuntime {
     });
 
     this.bot.command('topics', async (ctx) => {
+      if (!isAdmin(ctx)) return deny(ctx);
       const mappings = [...this.bridges].flatMap((bridge) =>
         bridge.store.listMappings().map((item) => ({
           account: bridge.config.accountLabel || bridge.config.accountId || 'Zalo',
@@ -202,6 +529,22 @@ class SharedTelegramRuntime {
     });
 
     this.bot.on(message('photo'), async (ctx) => {
+      if (ctx.chat?.type === 'private') {
+        if (!(await isAiUser(ctx))) return deny(ctx);
+        try {
+          await ctx.sendChatAction('typing');
+          const imageUrl = await telegramPhotoDataUrl(ctx);
+          const answer = await this.manager.chatWithAi(
+            ctx.from.id,
+            ctx.message.caption || 'Hãy phân tích hình ảnh này.',
+            [imageUrl],
+          );
+          for (const part of splitTelegramText(answer)) await ctx.reply(part, isAdmin(ctx) ? MANAGEMENT_MENU : AI_USER_MENU);
+        } catch (error) {
+          await ctx.reply(`Không phân tích được ảnh: ${humanError(error)}`, isAdmin(ctx) ? MANAGEMENT_MENU : AI_USER_MENU);
+        }
+        return;
+      }
       await this.routeTelegramMessage(ctx, 'photo');
     });
 
@@ -280,6 +623,29 @@ function getRuntime(config, logger) {
     runtimes.set(key, new SharedTelegramRuntime(config, logger));
   }
   return runtimes.get(key);
+}
+
+export async function startTelegramControlBot({ config, manager, logger }) {
+  const runtime = getRuntime(config, logger);
+  runtime.manager = manager;
+  runtime.controlStarted = true;
+  await runtime.start();
+  return runtime;
+}
+
+export function stopTelegramControlBot(runtime, reason = 'shutdown') {
+  if (!runtime) return;
+  runtime.controlStarted = false;
+  if (runtime.bridges.size > 0) return;
+  if (runtime.isWebhookMode) {
+    webhookHandlers.delete(runtime.webhookPath);
+    runtime.bot.telegram.deleteWebhook().catch(() => {});
+  } else if (runtime.started) {
+    runtime.bot.stop(reason);
+  }
+  runtime.started = false;
+  runtime.handlersRegistered = false;
+  runtime._recreateBot();
 }
 
 export class TelegramBridgeBot {

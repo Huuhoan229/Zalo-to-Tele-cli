@@ -1,10 +1,12 @@
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs/promises';
+import path from 'node:path';
 import { MongoClient } from 'mongodb';
 import { createLogger } from './logger.js';
 import { BridgeController } from './bridgeController.js';
 import { Store } from './store.js';
+import { completeChat } from './ai.js';
 import {
   createAccountDraft,
   loadAccountsFile,
@@ -31,6 +33,7 @@ export class BridgeManager extends EventEmitter {
     this.mongoCollectionName = process.env.MONGODB_COLLECTION_NAME?.trim() || 'bridge_state';
     this.mongoClient = null;
     this.accountsCollection = null;
+    this.controlStore = null;
     this.rootLogger = createLogger({
       scope: 'app',
       consoleOutput,
@@ -87,6 +90,14 @@ export class BridgeManager extends EventEmitter {
       }
     }
     await this.persist();
+
+    this.controlStore = new Store(path.join(this.baseDir, 'data', 'telegram-control.json'), {
+      mongoUri: this.mongoUri,
+      mongoDbName: this.mongoDbName,
+      mongoCollectionName: this.mongoCollectionName,
+      accountId: '__telegram_control__',
+    });
+    await this.controlStore.load();
 
     this.state.selectedAccountId = this.accounts[0]?.id || null;
     this.emitState();
@@ -227,7 +238,7 @@ export class BridgeManager extends EventEmitter {
     return this.controllers.get(id) || null;
   }
 
-  async startAccount(id) {
+  async startAccount(id, { onController } = {}) {
     const account = this.getAccount(id);
     if (!account) throw new Error('Account not found');
     if (this.controllers.has(id)) {
@@ -272,6 +283,7 @@ export class BridgeManager extends EventEmitter {
       this.emitState();
     });
     this.controllers.set(id, controller);
+    onController?.(controller);
     controller.start().catch((error) => {
       this.pushLog({
         timestamp: new Date().toISOString(),
@@ -302,7 +314,7 @@ export class BridgeManager extends EventEmitter {
     this.emitState();
   }
 
-  async reloginAccount(id) {
+  async reloginAccount(id, options = {}) {
     const account = this.getAccount(id);
     if (!account) throw new Error('Account not found');
     await this.stopAccount(id);
@@ -322,7 +334,136 @@ export class BridgeManager extends EventEmitter {
     }
     await fs.rm(account.zaloCredentialsFile, { force: true });
     await this.updateAccount(id, { zaloLoginMode: 'qr' });
+    return this.startAccount(id, options);
+  }
+
+  getAiController(accountId = null) {
+    if (accountId) return this.controllers.get(accountId) || null;
+    return [...this.controllers.values()].find((controller) => controller.status === 'running') ||
+      this.controllers.values().next().value || null;
+  }
+
+  getAiAccount() {
+    return this.accounts.find((item) => item.enabled) || this.accounts[0] || null;
+  }
+
+  async withAiStore(action, accountId = null) {
+    const controller = this.getAiController(accountId);
+    if (controller) {
+      await controller.ready;
+      return action(controller.store);
+    }
+    const account = accountId ? this.getAccount(accountId) : this.getAiAccount();
+    if (!account) throw new Error('Chưa có cấu hình tài khoản Zalo.');
+    const store = new Store(account.dataFile, {
+      mongoUri: account.mongoUri,
+      mongoDbName: account.mongoDbName,
+      mongoCollectionName: account.mongoCollectionName,
+      ocrQueueCollectionName: account.ocrQueueCollectionName,
+      accountId: account.id,
+    });
+    try {
+      await store.load();
+      return await action(store);
+    } finally {
+      await store.close();
+    }
+  }
+
+  async withControlStore(action) {
+    if (!this.controlStore) {
+      this.controlStore = new Store(path.join(this.baseDir, 'data', 'telegram-control.json'), {
+        mongoUri: this.mongoUri,
+        mongoDbName: this.mongoDbName,
+        mongoCollectionName: this.mongoCollectionName,
+        accountId: '__telegram_control__',
+      });
+      await this.controlStore.load();
+    }
+    return action(this.controlStore);
+  }
+
+  async chatWithAi(userId, prompt, imageUrls = []) {
+    if (!this.isAiAdmin(userId) && !(await this.withControlStore((store) => store.getAllowedTelegramAiUsers().includes(Number(userId))))) {
+      throw new Error(`Telegram ID ${userId} chưa được cấp quyền chat AI. Nhờ quản trị viên chạy /allowai ${userId}.`);
+    }
+    return this.withControlStore(async (store) => {
+      const answer = await completeChat({
+        baseUrl: process.env.AI_BASE_URL || process.env.ROUTER_BASE_URL,
+        apiKey: process.env.AI_API_KEY || process.env.ROUTER_API_KEY,
+        model: process.env.AI_MODEL || process.env.DEFAULT_MODEL,
+        systemPrompt: process.env.AI_SYSTEM_PROMPT || 'Bạn là trợ lý hữu ích. Trả lời bằng ngôn ngữ người dùng sử dụng.',
+        history: store.getTelegramAiHistory(userId),
+        text: prompt,
+        imageUrls,
+      });
+      await store.appendTelegramAiTurn(userId, prompt, answer);
+      return answer;
+    });
+  }
+
+  isAiAdmin(userId) {
+    const admins = String(process.env.TELEGRAM_ADMIN_IDS || '')
+      .split(',').map((item) => item.trim()).filter(Boolean).map(Number);
+    return admins.includes(Number(userId));
+  }
+
+  async isAiUserAllowed(userId) {
+    return this.isAiAdmin(userId) ||
+      this.withControlStore((store) => store.getAllowedTelegramAiUsers().includes(Number(userId)));
+  }
+
+  async listAiUsers() {
+    return this.withControlStore((store) => store.getAllowedTelegramAiUsers());
+  }
+
+  async setAiUserAllowed(userId, allowed) {
+    return this.withControlStore((store) => store.setTelegramAiUserAllowed(userId, allowed));
+  }
+
+  async setZaloAiMode(mode, accountId = null) {
+    if (!['off', 'command', 'dm', 'all'].includes(mode)) throw new Error('Chế độ AI không hợp lệ.');
+    return this.withAiStore((store) => store.setZaloAiMode(mode), accountId);
+  }
+
+  async getZaloAiMode(accountId = null) {
+    return this.withAiStore((store) => store.getZaloAiMode(), accountId);
+  }
+
+  async clearAiHistory(userId) {
+    return this.withControlStore((store) => store.clearTelegramAiHistory(userId));
+  }
+
+  async requestZaloQr(onQr, accountId = null) {
+    const account = accountId
+      ? this.getAccount(accountId)
+      : this.accounts.find((item) => item.enabled) || this.accounts[0];
+    if (!account) throw new Error('Chưa có tài khoản Zalo.');
+    await this.reloginAccount(account.id, {
+      onController: (controller) => {
+        controller.on('qr', (event) => onQr(event.qrImageBase64));
+      },
+    });
+  }
+
+  async addZaloAccount(label, onQr) {
+    const account = await this.addAccount({ label: String(label || '').trim() || undefined });
+    await this.startAccount(account.id, {
+      onController: (controller) => {
+        controller.on('qr', (event) => onQr(event.qrImageBase64));
+      },
+    });
+    return account;
+  }
+
+  async startManagedAccount(id) {
+    await this.updateAccount(id, { autoStart: true, enabled: true });
     return this.startAccount(id);
+  }
+
+  async stopManagedAccount(id) {
+    await this.updateAccount(id, { autoStart: false });
+    return this.stopAccount(id);
   }
 
   async startAll() {
@@ -342,6 +483,8 @@ export class BridgeManager extends EventEmitter {
       this.mongoClient = null;
       this.accountsCollection = null;
     }
+    await this.controlStore?.close();
+    this.controlStore = null;
   }
 
   async selectAccount(id) {

@@ -3,6 +3,7 @@ import { Store } from './store.js';
 import { ZaloClient } from './zaloClient.js';
 import { TelegramBridgeBot } from './telegramBot.js';
 import { createLogger } from './logger.js';
+import { completeChat } from './ai.js';
 
 function cleanMessageText(text) {
   return String(text || '').trim();
@@ -81,7 +82,7 @@ export class BridgeController extends EventEmitter {
       this.zalo.on('qr', ({ qrPath, qrImageBase64 }) => {
         this.qrPath = qrPath;
         this.qrImageBase64 = qrImageBase64 || null;
-        this.emit('qr', { qrPath });
+        this.emit('qr', { qrPath, qrImageBase64: this.qrImageBase64 });
         this.emitChange();
       });
       this.zalo.on('qrScanned', ({ account }) => {
@@ -120,6 +121,12 @@ export class BridgeController extends EventEmitter {
               .map((item) => item.trim())
               .filter(Boolean)
               .map((item) => Number(item))
+              .filter((item) => Number.isSafeInteger(item)),
+          ),
+          telegramAdminIds: new Set(
+            String(process.env.TELEGRAM_ADMIN_IDS || '')
+              .split(',')
+              .map((item) => Number(item.trim()))
               .filter((item) => Number.isSafeInteger(item)),
           ),
           downloadDir: this.account.downloadDir,
@@ -173,6 +180,7 @@ export class BridgeController extends EventEmitter {
 
         await this.queueForOcr(message);
         await this.telegram.forwardZaloMessage(message);
+        await this.maybeReplyWithAi(message);
         await this.relayToLocalIngest(message);
       });
 
@@ -454,6 +462,81 @@ export class BridgeController extends EventEmitter {
     });
   }
 
+  getZaloAiMode() {
+    return this.store.getZaloAiMode();
+  }
+
+  async setZaloAiMode(mode) {
+    const supported = new Set(['off', 'command', 'dm', 'all']);
+    if (!supported.has(mode)) throw new Error('Chế độ AI Zalo phải là off, command, dm hoặc all.');
+    await this.store.setZaloAiMode(mode);
+    this.emitChange();
+    return mode;
+  }
+
+  async chatWithAi(userId, text, imageUrls = []) {
+    const answer = await completeChat({
+      baseUrl: process.env.AI_BASE_URL || process.env.ROUTER_BASE_URL,
+      apiKey: process.env.AI_API_KEY || process.env.ROUTER_API_KEY,
+      model: process.env.AI_MODEL || process.env.DEFAULT_MODEL,
+      systemPrompt: process.env.AI_SYSTEM_PROMPT || 'Bạn là trợ lý hữu ích. Trả lời bằng ngôn ngữ người dùng sử dụng.',
+      history: this.store.getTelegramAiHistory(userId),
+      text,
+      imageUrls,
+    });
+    await this.store.appendTelegramAiTurn(userId, text, answer);
+    return answer;
+  }
+
+  async clearAiHistory(userId) {
+    await this.store.clearTelegramAiHistory(userId);
+  }
+
+  async maybeReplyWithAi(message) {
+    if (!message || message.isSelf || (!message.text?.trim() && !message.attachment?.url)) return;
+    const mode = this.getZaloAiMode();
+    if (mode === 'off') return;
+    const raw = message.raw?.data || {};
+    const mentionsSelf = Array.isArray(raw.mentions) && raw.mentions.some((item) =>
+      String(item.uid) === String(this.zalo?.selfUserId),
+    );
+    const messageText = String(message.text || '').trim();
+    const commandMatch = /^\/(?:ask|ai)(?:@[\w]+)?(?:\s+|$)/i.exec(messageText);
+    let prompt = messageText || 'Mô tả và trả lời về hình ảnh người dùng gửi.';
+    let shouldReply = false;
+    if (commandMatch) {
+      prompt = prompt.slice(commandMatch[0].length).trim();
+      shouldReply = Boolean(prompt);
+    } else if (mode === 'all') {
+      shouldReply = true;
+    } else if (mode === 'dm' && (!message.isGroup || mentionsSelf)) {
+      shouldReply = true;
+    } else if ((mode === 'command' || mode === 'dm') && message.isGroup && mentionsSelf) {
+      shouldReply = true;
+    }
+    if (!shouldReply) return;
+    if (message.isGroup && message.senderName) prompt = `[${message.senderName}] ${prompt}`;
+
+    try {
+      const answer = await completeChat({
+        baseUrl: process.env.AI_BASE_URL || process.env.ROUTER_BASE_URL,
+        apiKey: process.env.AI_API_KEY || process.env.ROUTER_API_KEY,
+        model: process.env.AI_MODEL || process.env.DEFAULT_MODEL,
+        systemPrompt: process.env.AI_SYSTEM_PROMPT || 'Bạn là trợ lý hữu ích. Trả lời bằng ngôn ngữ người dùng sử dụng.',
+        history: this.store.getZaloAiHistory(message.conversationId),
+        text: prompt,
+        imageUrls: message.attachment?.url ? [message.attachment.url] : [],
+      });
+      if (this.manualStop || this.getZaloAiMode() === 'off') return;
+      await this.store.appendZaloAiTurn(message.conversationId, prompt, answer);
+      for (let offset = 0; offset < answer.length; offset += 3000) {
+        await this.sendText(message.conversationId, answer.slice(offset, offset + 3000));
+      }
+    } catch (error) {
+      this.logger.error({ error, conversationId: message.conversationId }, 'Could not answer Zalo message with AI.');
+    }
+  }
+
   getConversationList() {
     return this.store.listConversations();
   }
@@ -471,6 +554,7 @@ export class BridgeController extends EventEmitter {
       qrPath: this.qrPath,
       qrImageBase64: this.qrImageBase64,
       listenerConnected: this.listenerConnected,
+      zaloAiMode: this.getZaloAiMode(),
       conversations: this.getConversationList(),
     };
   }

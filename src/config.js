@@ -30,6 +30,10 @@ function parseAllowedUsers(raw) {
   );
 }
 
+function parseTelegramIds(raw) {
+  return new Set(String(raw || '').split(',').map((item) => item.trim()).filter(Boolean).map(Number).filter(Number.isSafeInteger));
+}
+
 function parsePort(value, fallback) {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
@@ -48,6 +52,10 @@ export const config = {
   webPort: parsePort(process.env.PORT || process.env.WEB_PORT, 3000),
   webAccessToken: process.env.WEB_ACCESS_TOKEN?.trim() || '',
   allowedTelegramUserIds: parseAllowedUsers(process.env.ALLOWED_TELEGRAM_USER_IDS),
+  telegramAdminIds: parseTelegramIds(process.env.TELEGRAM_ADMIN_IDS),
+  aiBaseUrl: (process.env.AI_BASE_URL || process.env.ROUTER_BASE_URL || '').trim().replace(/\/+$/, ''),
+  aiApiKey: (process.env.AI_API_KEY || process.env.ROUTER_API_KEY || '').trim(),
+  aiModel: (process.env.AI_MODEL || process.env.DEFAULT_MODEL || '').trim(),
   mongoUri: process.env.MONGODB_URI?.trim() || '',
   mongoDbName: process.env.MONGODB_DB_NAME?.trim() || 'zalo-to-tele',
   mongoCollectionName: process.env.MONGODB_COLLECTION_NAME?.trim() || 'bridge_state',
