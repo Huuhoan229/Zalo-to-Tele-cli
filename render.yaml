@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: zalo-to-tele-bridge
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: WEB_ACCESS_TOKEN
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_FORUM_CHAT_ID
+        sync: false
+      - key: ALLOWED_TELEGRAM_USER_IDS
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB_NAME
+        value: zalo-to-tele
+      - key: MONGODB_COLLECTION_NAME
+        value: bridge_state
+      - key: MONGODB_QUEUE_COLLECTION_NAME
+        value: ocr_queue
+      - key: ZALO_LOGIN_MODE
+        value: qr

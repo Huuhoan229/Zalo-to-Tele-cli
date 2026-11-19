@@ -60,6 +60,10 @@ function renderAccountCard(account, accessToken) {
           : `<p>Chưa có QR mới. Nếu app đã đăng nhập bằng credentials thì không cần scan lại.</p>`
       }
       ${account.lastError ? `<pre>${escapeHtml(account.lastError)}</pre>` : ''}
+      <div class="toolbar">
+        <button type="button" data-action="relogin" data-account-id="${escapeHtml(account.id)}">Quét QR lại</button>
+        <button type="button" data-action="remove" data-account-id="${escapeHtml(account.id)}">Xóa tài khoản</button>
+      </div>
     </section>`;
 }
 
@@ -74,7 +78,6 @@ function renderPage(status, accessToken) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="5">
   <title>Zalo-to-Tele</title>
   <style>
     :root { color-scheme: light dark; font-family: Arial, sans-serif; }
@@ -93,6 +96,9 @@ function renderPage(status, accessToken) {
     img { width: min(320px, 100%); height: auto; image-rendering: pixelated; border: 1px solid #d9e0e7; border-radius: 8px; background: #fff; }
     pre { overflow: auto; padding: 12px; background: #111827; color: #e5e7eb; border-radius: 8px; font-size: 13px; white-space: pre-wrap; }
     a { color: #0f766e; }
+    .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 16px 0; }
+    input, button { font: inherit; border: 1px solid #c7d2da; border-radius: 8px; padding: 10px 12px; }
+    button { cursor: pointer; background: #0f766e; border-color: #0f766e; color: #fff; }
     @media (prefers-color-scheme: dark) {
       body { background: #111827; color: #eef2f7; }
       .panel { background: #1f2937; border-color: #374151; }
@@ -105,12 +111,92 @@ function renderPage(status, accessToken) {
 <body>
   <main>
     <h1>Zalo-to-Tele</h1>
-    <p>Status: <strong>${escapeHtml(status.status)}</strong> - ${running}/${total} account running</p>
+    <p id="summary">Status: <strong>${escapeHtml(status.status)}</strong> - ${running}/${total} account running</p>
+    <form id="add-account-form" class="toolbar">
+      <input name="label" type="text" maxlength="80" placeholder="Tên tài khoản, ví dụ Zalo 2">
+      <button type="submit">+ Thêm tài khoản Zalo</button>
+      <span id="action-error" role="status"></span>
+    </form>
     <p><a href="${statusPath}">JSON status</a></p>
     <div class="grid">
       ${status.accounts.map((account) => renderAccountCard(account, accessToken)).join('')}
     </div>
   </main>
+  <script>
+    const statusUrl = ${JSON.stringify(statusPath)};
+    const apiRoot = '/api/accounts';
+    const tokenValue = ${JSON.stringify(accessToken ? encodeURIComponent(accessToken) : '')};
+    const tokenQuery = tokenValue ? '?token=' + tokenValue : '';
+    const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+    function drawAccounts(accounts) {
+      const grid = document.querySelector('.grid');
+      grid.innerHTML = accounts.map((account) => {
+        const image = account.qrImageBase64 ? 'data:image/png;base64,' + account.qrImageBase64 :
+          account.qrAvailable ? '/qr?account=' + encodeURIComponent(account.id) + '&t=' + Date.now() + (tokenValue ? '&token=' + tokenValue : '') : '';
+        return '<section class="panel"><div class="account-head"><div><h2>' + esc(account.label || account.id) +
+          '</h2><p>' + esc(account.accountName || account.label || account.id) + '</p></div><strong class="badge">' +
+          esc(account.status || 'unknown') + '</strong></div><dl><div><dt>Listener</dt><dd>' +
+          (account.listenerConnected ? 'connected' : 'not connected') + '</dd></div><div><dt>Topics</dt><dd>' +
+          Number(account.conversationCount || 0) + '</dd></div></dl>' +
+          (image ? '<p>Quét QR bằng Zalo mobile rồi xác nhận trên điện thoại.</p><img alt="Zalo login QR" src="' + image + '">' :
+            '<p>Chưa có QR mới. Nếu tài khoản đã đăng nhập thì không cần quét lại.</p>') +
+          (account.lastError ? '<pre>' + esc(account.lastError) + '</pre>' : '') +
+          '<div class="toolbar"><button type="button" data-action="relogin" data-account-id="' + esc(account.id) +
+          '">Quét QR lại</button><button type="button" data-action="remove" data-account-id="' + esc(account.id) +
+          '">Xóa tài khoản</button></div></section>';
+      }).join('');
+    }
+    async function refreshStatus() {
+      try {
+        const response = await fetch(statusUrl, { cache: 'no-store' });
+        if (!response.ok) return;
+        const data = await response.json();
+        const runningCount = data.accounts.filter((a) => a.status === 'running').length;
+        document.querySelector('#summary').textContent = 'Status: ' + data.status + ' - ' + runningCount + '/' + data.accounts.length + ' account running';
+        drawAccounts(data.accounts);
+      } catch {}
+    }
+    async function requestAccountAction(url, method, payload) {
+      const response = await fetch(url, {
+        method,
+        headers: {'Content-Type': 'application/json'},
+        body: payload ? JSON.stringify(payload) : undefined
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || 'Thao tác thất bại');
+      document.querySelector('#action-error').textContent = '';
+      await refreshStatus();
+    }
+    document.querySelector('#add-account-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const button = form.querySelector('button');
+      button.disabled = true;
+      try {
+        const label = new FormData(form).get('label');
+        await requestAccountAction(apiRoot + tokenQuery, 'POST', {label});
+        form.reset();
+      } catch (error) { document.querySelector('#action-error').textContent = error.message; }
+      finally { button.disabled = false; }
+    });
+    document.querySelector('.grid').addEventListener('click', async (event) => {
+      const button = event.target.closest('button[data-action]');
+      if (!button) return;
+      const id = encodeURIComponent(button.dataset.accountId);
+      const action = button.dataset.action;
+      if (action === 'remove' && !confirm('Xóa tài khoản này?')) return;
+      button.disabled = true;
+      try {
+        await requestAccountAction(
+          action === 'relogin' ? apiRoot + '/' + id + '/relogin' + tokenQuery : apiRoot + '/' + id + tokenQuery,
+          action === 'relogin' ? 'POST' : 'DELETE'
+        );
+      } catch (error) { document.querySelector('#action-error').textContent = error.message; }
+      finally { button.disabled = false; }
+    });
+    refreshStatus();
+    setInterval(refreshStatus, 2000);
+  </script>
 </body>
 </html>`;
   }
@@ -178,7 +264,31 @@ async function fileExists(filePath) {
   }
 }
 
-export function startWebServer({ port, accessToken, getStatus, getQrPath, logger, webhookHandlers }) {
+async function readRequestBody(req) {
+  const chunks = [];
+  let length = 0;
+  for await (const chunk of req) {
+    length += chunk.length;
+    if (length > 16 * 1024) throw new Error('Request body is too large');
+    chunks.push(chunk);
+  }
+  const raw = Buffer.concat(chunks).toString('utf8');
+  if (!raw) return {};
+  if (req.headers['content-type']?.includes('application/json')) return JSON.parse(raw);
+  return Object.fromEntries(new URLSearchParams(raw));
+}
+
+export function startWebServer({
+  port,
+  accessToken,
+  getStatus,
+  getQrPath,
+  logger,
+  webhookHandlers,
+  onAddAccount,
+  onRemoveAccount,
+  onReloginAccount,
+}) {
   const server = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url || '/', 'http://localhost');
@@ -202,6 +312,80 @@ export function startWebServer({ port, accessToken, getStatus, getQrPath, logger
 
       if (!authorized(req, url, accessToken)) {
         send(res, 401, 'Unauthorized\n', { 'Content-Type': 'text/plain; charset=utf-8' });
+        return;
+      }
+
+      if (
+        req.method !== 'GET' &&
+        url.pathname.startsWith('/api/accounts') &&
+        !accessToken
+      ) {
+        send(res, 503, JSON.stringify({ error: 'Set WEB_ACCESS_TOKEN to enable account management' }), {
+          'Content-Type': 'application/json; charset=utf-8',
+        });
+        return;
+      }
+
+      if (url.pathname === '/api/accounts' && req.method === 'POST') {
+        if (!onAddAccount) {
+          send(res, 503, JSON.stringify({ error: 'Account management is unavailable' }), {
+            'Content-Type': 'application/json; charset=utf-8',
+          });
+          return;
+        }
+        try {
+          const input = await readRequestBody(req);
+          const account = await onAddAccount({ label: String(input.label || '').trim() });
+          send(res, 201, JSON.stringify({ account }), {
+            'Content-Type': 'application/json; charset=utf-8',
+          });
+        } catch (error) {
+          send(res, 400, JSON.stringify({ error: error?.message || 'Could not add account' }), {
+            'Content-Type': 'application/json; charset=utf-8',
+          });
+        }
+        return;
+      }
+
+      const accountAction = url.pathname.match(/^\/api\/accounts\/([^/]+)\/(relogin)$/);
+      if (accountAction && req.method === 'POST') {
+        if (!onReloginAccount) {
+          send(res, 503, JSON.stringify({ error: 'QR relogin is unavailable' }), {
+            'Content-Type': 'application/json; charset=utf-8',
+          });
+          return;
+        }
+        try {
+          const account = await onReloginAccount(decodeURIComponent(accountAction[1]));
+          send(res, 202, JSON.stringify({ account }), {
+            'Content-Type': 'application/json; charset=utf-8',
+          });
+        } catch (error) {
+          send(res, 400, JSON.stringify({ error: error?.message || 'Could not restart account' }), {
+            'Content-Type': 'application/json; charset=utf-8',
+          });
+        }
+        return;
+      }
+
+      const accountDelete = url.pathname.match(/^\/api\/accounts\/([^/]+)$/);
+      if (accountDelete && req.method === 'DELETE') {
+        if (!onRemoveAccount) {
+          send(res, 503, JSON.stringify({ error: 'Account removal is unavailable' }), {
+            'Content-Type': 'application/json; charset=utf-8',
+          });
+          return;
+        }
+        try {
+          await onRemoveAccount(decodeURIComponent(accountDelete[1]));
+          send(res, 200, JSON.stringify({ ok: true }), {
+            'Content-Type': 'application/json; charset=utf-8',
+          });
+        } catch (error) {
+          send(res, 400, JSON.stringify({ error: error?.message || 'Could not remove account' }), {
+            'Content-Type': 'application/json; charset=utf-8',
+          });
+        }
         return;
       }
 

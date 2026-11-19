@@ -62,6 +62,7 @@ npm run telegram:id
 ```
 
 Then send `/id` inside the Telegram group. Use the `chat_id` value for `TELEGRAM_FORUM_CHAT_ID`. It usually starts with `-100`.
+Put your Telegram user ID in `ALLOWED_TELEGRAM_USER_IDS`. An empty allowlist disables Telegram-to-Zalo forwarding; `/id` remains available so you can look up the ID.
 
 ## MongoDB Setup
 
@@ -221,6 +222,19 @@ After deploy:
 6. Reply inside that Telegram topic to send back to the same Zalo conversation.
 
 With MongoDB enabled, redeploying Koyeb does not lose Zalo sessions or topic mappings. Temporary downloaded images may be stored in `/tmp` while forwarding, then deleted after use.
+
+## Render Deployment
+
+This repository includes a Render Blueprint at `render.yaml`. Create a Blueprint from this repository and set:
+
+- `WEB_ACCESS_TOKEN`: a long private token protecting the QR and account-management page.
+- `TELEGRAM_BOT_TOKEN` and `TELEGRAM_FORUM_CHAT_ID`.
+- `MONGODB_URI`: use MongoDB Atlas or another MongoDB service. Render Free has an ephemeral filesystem, so MongoDB is needed to retain Zalo sessions, account registry, and chat mappings across restarts.
+- `ALLOWED_TELEGRAM_USER_IDS`: Telegram user ID(s) permitted to send messages back to Zalo. Use `/id` to look them up; separate multiple IDs with commas.
+
+After the first deploy, Render assigns a service URL. Open `https://<your-service>.onrender.com/?token=<WEB_ACCESS_TOKEN>`. The page has a "+ Thêm tài khoản Zalo" button; each added account gets a QR card and the account list is saved in MongoDB. The same page supports QR relogin and account removal.
+
+Render Free services sleep after 15 minutes without inbound web traffic. A periodic external request to `/healthz` can keep a service active, but that consumes its free instance hours. Two continuously active services use the shared workspace allowance twice as quickly.
 
 ## Keep Koyeb Awake With Cron
 

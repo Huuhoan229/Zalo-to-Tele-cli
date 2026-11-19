@@ -58,6 +58,16 @@ async function main() {
         webAccessProtected: Boolean(config.webAccessToken),
       };
     },
+    onAddAccount: async (input) => {
+      const account = await manager.addAccount(input);
+      await manager.startAccount(account.id);
+      return manager.publicAccount(account, manager.getController(account.id));
+    },
+    onReloginAccount: async (id) => {
+      await manager.reloginAccount(id);
+      return manager.publicAccount(manager.getAccount(id), manager.getController(id));
+    },
+    onRemoveAccount: (id) => manager.removeAccount(id),
   });
 
   async function shutdown(reason) {

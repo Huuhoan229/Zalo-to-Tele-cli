@@ -25,7 +25,7 @@ function topicName(title, accountLabel = '') {
 }
 
 function isAllowed(config, userId) {
-  return config.allowedTelegramUserIds.size === 0 || config.allowedTelegramUserIds.has(userId);
+  return config.allowedTelegramUserIds.has(userId);
 }
 
 function isTelegramThreadNotFound(error) {
@@ -37,8 +37,20 @@ function formatZaloMessage(zaloMessage) {
   const prefix = zaloMessage.isGroup
     ? `[${zaloMessage.senderName}]`
     : `[${zaloMessage.title || zaloMessage.senderName}]`;
-  const body = zaloMessage.text || zaloMessage.attachment?.title || '(non-text message)';
-  return `${prefix}\n${body}`;
+  const quoted = zaloMessage.replyTo?.text
+    ? `↪ Trả lời ${zaloMessage.replyTo.senderName ? `[${zaloMessage.replyTo.senderName}]` : ''}: ${zaloMessage.replyTo.text}\n\n`
+    : '';
+  const body = zaloMessage.text ||
+    (zaloMessage.attachment?.type === 'sticker' ? '🎭 Sticker' : zaloMessage.attachment?.title) ||
+    '(non-text message)';
+  return `${prefix}\n${quoted}${body}`;
+}
+
+function quoteDataForZalo(zaloMessage) {
+  const data = zaloMessage.raw?.data;
+  if (!data || (!data.msgId && !data.cliMsgId)) return null;
+  const keys = ['content', 'msgType', 'propertyExt', 'uidFrom', 'msgId', 'cliMsgId', 'ts', 'ttl'];
+  return Object.fromEntries(keys.filter((key) => data[key] !== undefined).map((key) => [key, data[key]]));
 }
 
 function telegramSenderName(ctx) {
@@ -62,6 +74,9 @@ class SharedTelegramRuntime {
     this.bridges = new Set();
     this.handlersRegistered = false;
     this.started = false;
+    this.startingPromise = null;
+    this.processedUpdates = new Map();
+    this.inFlightUpdates = new Set();
     // Webhook mode: đọc TELEGRAM_WEBHOOK_URL từ env (setting toàn deployment).
     // Nếu không set → fallback về long polling (chạy local).
     const webhookBaseUrl = process.env.TELEGRAM_WEBHOOK_URL?.trim().replace(/\/$/, '') || '';
@@ -99,40 +114,48 @@ class SharedTelegramRuntime {
         this.bot.stop(reason);
       }
       this.started = false;
+      this.handlersRegistered = false;
+      this._recreateBot();
     }
   }
 
   async start() {
     if (this.started) return;
+    if (this.startingPromise) return this.startingPromise;
 
-    if (!this.handlersRegistered) {
-      this._recreateBot();
-    }
-    this.registerHandlers();
+    this.startingPromise = (async () => {
+      if (!this.handlersRegistered) this._recreateBot();
+      this.registerHandlers();
 
-    if (this.isWebhookMode) {
-      // --- WEBHOOK MODE ---
-      // Telegram sẽ push updates về URL này thay vì bot phải poll.
-      // Không bao giờ bị 409 Conflict vì không có getUpdates cạnh tranh.
-      const fullUrl = `${this.webhookBaseUrl}${this.webhookPath}`;
-      await this.bot.telegram.setWebhook(fullUrl);
-      // Đăng ký handler vào Map để HTTP server route vào.
-      webhookHandlers.set(this.webhookPath, this.bot.webhookCallback(this.webhookPath));
-      this.started = true;
-      this.logger.info({ url: fullUrl }, 'Telegram webhook registered.');
-    } else {
-      // --- LONG POLLING MODE (local dev fallback) ---
-      // Kick session cũ trước để tránh 409 Conflict khi restart.
+      if (this.isWebhookMode) {
+        const fullUrl = `${this.webhookBaseUrl}${this.webhookPath}`;
+        await this.bot.telegram.setWebhook(fullUrl);
+        webhookHandlers.set(this.webhookPath, this.bot.webhookCallback(this.webhookPath));
+        this.started = true;
+        this.logger.info({ url: fullUrl }, 'Telegram webhook registered.');
+        return;
+      }
+
       try {
         await this.bot.telegram.callApi('getUpdates', { timeout: 0, offset: -1 });
         this.logger.info('Kicked stale getUpdates session before launch.');
       } catch (err) {
         this.logger.warn({ code: err?.response?.error_code }, 'Pre-launch getUpdates kick (may 409, that is OK).');
       }
-      await this.bot.launch();
+
+      // Telegraf's polling launch promise can stay pending for the bot lifetime.
+      // Mark the runtime started before launching and observe failures separately.
       this.started = true;
+      this.bot.launch().catch((err) => {
+        this.started = false;
+        this.logger.error({ err }, 'Telegram polling stopped with error.');
+      });
       this.logger.info('Telegram bot started (long polling).');
-    }
+    })().finally(() => {
+      this.startingPromise = null;
+    });
+
+    return this.startingPromise;
   }
 
   findBridgeByTopic(topicId) {
@@ -192,6 +215,7 @@ class SharedTelegramRuntime {
   }
 
   async routeTelegramMessage(ctx, type) {
+    const updateId = ctx.update?.update_id;
     if (ctx.chat?.id !== this.config.telegramForumChatId) return;
     if (!ctx.message.message_thread_id) {
       if (type !== 'text') {
@@ -208,15 +232,33 @@ class SharedTelegramRuntime {
       return;
     }
 
-    if (type === 'text') {
-      await routed.bridge.forwardTelegramText(ctx, routed.mapping);
-      return;
+    const dedupeKey = Number.isSafeInteger(updateId) ? String(updateId) : null;
+    if (dedupeKey) {
+      const now = Date.now();
+      for (const [id, timestamp] of this.processedUpdates) {
+        if (now - timestamp > 24 * 60 * 60 * 1000) this.processedUpdates.delete(id);
+      }
+      if (this.processedUpdates.has(dedupeKey) || this.inFlightUpdates.has(dedupeKey)) return;
+      this.inFlightUpdates.add(dedupeKey);
     }
-    if (type === 'photo') {
-      await routed.bridge.forwardTelegramPhoto(ctx, routed.mapping);
-      return;
+
+    try {
+      if (type === 'text') {
+        await routed.bridge.forwardTelegramText(ctx, routed.mapping);
+      } else if (type === 'photo') {
+        await routed.bridge.forwardTelegramPhoto(ctx, routed.mapping);
+      } else {
+        await routed.bridge.forwardTelegramDocument(ctx, routed.mapping);
+      }
+      if (dedupeKey) {
+        this.processedUpdates.set(dedupeKey, Date.now());
+        if (this.processedUpdates.size > 10000) {
+          this.processedUpdates.delete(this.processedUpdates.keys().next().value);
+        }
+      }
+    } finally {
+      if (dedupeKey) this.inFlightUpdates.delete(dedupeKey);
     }
-    await routed.bridge.forwardTelegramDocument(ctx, routed.mapping);
   }
 }
 
@@ -236,6 +278,7 @@ export class TelegramBridgeBot {
     this.logger = logger;
     this.pendingEcho = pendingEcho || null;
     this.onTranscript = onTranscript;
+    this.forwardingZaloMessages = new Set();
     this.runtime = getRuntime(config, logger);
     this.bot = this.runtime.bot;
   }
@@ -294,13 +337,24 @@ export class TelegramBridgeBot {
   }
 
   async forwardZaloMessage(zaloMessage) {
+    const messageId = String(zaloMessage.id || '');
+    const key = messageId ? `${zaloMessage.conversationId}:${messageId}` : '';
+    if (key && this.forwardingZaloMessages.has(key)) return;
+    if (key) this.forwardingZaloMessages.add(key);
+    try {
+      if (
+        messageId &&
+        this.store.listMessages(zaloMessage.conversationId).some((entry) => String(entry.id) === messageId)
+      ) return;
+
     let mapping = await this.ensureTopicForZaloMessage(zaloMessage);
     const direction = zaloMessage.isSelf ? 'out' : 'in';
     const source = zaloMessage.isSelf ? 'zalo-self' : 'zalo';
     const senderName = zaloMessage.senderName;
 
+    let telegramMessage;
     try {
-      await this.sendZaloMessageToTelegram(mapping, zaloMessage);
+      telegramMessage = await this.sendZaloMessageToTelegram(mapping, zaloMessage);
     } catch (error) {
       if (!isTelegramThreadNotFound(error)) throw error;
       this.logger.warn(
@@ -308,17 +362,23 @@ export class TelegramBridgeBot {
         'Telegram topic is missing; recreating topic mapping.',
       );
       mapping = await this.createTopicMapping(zaloMessage, mapping);
-      await this.sendZaloMessageToTelegram(mapping, zaloMessage);
+      telegramMessage = await this.sendZaloMessageToTelegram(mapping, zaloMessage);
     }
 
     await this.onTranscript?.(mapping, {
+      id: zaloMessage.id,
       direction,
       source,
       senderName,
       text: zaloMessage.text,
       attachment: zaloMessage.attachment,
+      telegramMessageId: telegramMessage?.message_id,
+      replyData: quoteDataForZalo(zaloMessage),
       threadType: zaloMessage.threadType,
     });
+    } finally {
+      if (key) this.forwardingZaloMessages.delete(key);
+    }
   }
 
   async sendZaloMessageToTelegram(mapping, zaloMessage) {
@@ -326,7 +386,7 @@ export class TelegramBridgeBot {
 
     if (zaloMessage.attachment?.url) {
       try {
-        await this.bot.telegram.sendPhoto(
+        return await this.bot.telegram.sendPhoto(
           this.config.telegramForumChatId,
           Input.fromURL(zaloMessage.attachment.url),
           {
@@ -337,7 +397,7 @@ export class TelegramBridgeBot {
       } catch (error) {
         if (isTelegramThreadNotFound(error)) throw error;
         this.logger.warn({ error }, 'Telegram could not fetch Zalo attachment URL; falling back to text.');
-        await this.bot.telegram.sendMessage(
+        return await this.bot.telegram.sendMessage(
           this.config.telegramForumChatId,
           `${formatZaloMessage(zaloMessage)}\n${zaloMessage.attachment.url}`,
           options,
@@ -346,7 +406,7 @@ export class TelegramBridgeBot {
       return;
     }
 
-    await this.bot.telegram.sendMessage(
+    return this.bot.telegram.sendMessage(
       this.config.telegramForumChatId,
       formatZaloMessage(zaloMessage),
       options,
@@ -360,6 +420,9 @@ export class TelegramBridgeBot {
 
     const mapping = mapped || this.store.getByTopic(ctx.message.message_thread_id);
     if (!mapping) return;
+    const quote = ctx.message.reply_to_message
+      ? this.store.getReplyData(ctx.message.reply_to_message.message_id)
+      : null;
 
     this.pendingEcho?.register?.(mapping.conversationId);
     try {
@@ -367,6 +430,7 @@ export class TelegramBridgeBot {
         conversationId: mapping.conversationId,
         threadType: mapping.threadType,
         text: ctx.message.text,
+        quote,
       });
     } catch (error) {
       this.pendingEcho?.consume?.(mapping.conversationId);
@@ -395,6 +459,9 @@ export class TelegramBridgeBot {
       await ctx.reply('Topic này chưa được map với cuộc trò chuyện Zalo nào.');
       return;
     }
+    const quote = ctx.message.reply_to_message
+      ? this.store.getReplyData(ctx.message.reply_to_message.message_id)
+      : null;
 
     const largestPhoto = ctx.message.photo.at(-1);
     const targetPath = await this.downloadTelegramFile(ctx, largestPhoto.file_id, largestPhoto.file_unique_id, 'jpg');
@@ -410,6 +477,7 @@ export class TelegramBridgeBot {
         threadType: mapping.threadType,
         filePath: targetPath,
         caption: ctx.message.caption,
+        quote,
       });
       this.logger.info(
         { topicId: ctx.message.message_thread_id, conversationId: mapping.conversationId },
@@ -452,6 +520,9 @@ export class TelegramBridgeBot {
       await ctx.reply('Topic này chưa được map với cuộc trò chuyện Zalo nào.');
       return;
     }
+    const quote = ctx.message.reply_to_message
+      ? this.store.getReplyData(ctx.message.reply_to_message.message_id)
+      : null;
 
     const extension = ctx.message.document.file_name?.split('.').pop() || 'jpg';
     const targetPath = await this.downloadTelegramFile(
@@ -472,6 +543,7 @@ export class TelegramBridgeBot {
         threadType: mapping.threadType,
         filePath: targetPath,
         caption: ctx.message.caption,
+        quote,
       });
       this.logger.info(
         { topicId: ctx.message.message_thread_id, conversationId: mapping.conversationId },

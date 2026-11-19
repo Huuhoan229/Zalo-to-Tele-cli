@@ -1,7 +1,10 @@
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs/promises';
+import { MongoClient } from 'mongodb';
 import { createLogger } from './logger.js';
 import { BridgeController } from './bridgeController.js';
+import { Store } from './store.js';
 import {
   createAccountDraft,
   loadAccountsFile,
@@ -23,6 +26,11 @@ export class BridgeManager extends EventEmitter {
     };
     this.controllers = new Map();
     this.accountsFilePath = null;
+    this.mongoUri = process.env.MONGODB_URI?.trim() || '';
+    this.mongoDbName = process.env.MONGODB_DB_NAME?.trim() || 'zalo-to-tele';
+    this.mongoCollectionName = process.env.MONGODB_COLLECTION_NAME?.trim() || 'bridge_state';
+    this.mongoClient = null;
+    this.accountsCollection = null;
     this.rootLogger = createLogger({
       scope: 'app',
       consoleOutput,
@@ -31,32 +39,47 @@ export class BridgeManager extends EventEmitter {
   }
 
   publicAccount(account, controller = null) {
-    const { telegramBotToken, ...safeAccount } = account;
+    const safeAccount = {
+      id: account.id,
+      label: account.label,
+      telegramForumChatId: account.telegramForumChatId,
+      enabled: account.enabled,
+      autoStart: account.autoStart,
+      zaloLoginMode: account.zaloLoginMode,
+      zaloSelfListen: account.zaloSelfListen,
+    };
     return {
       ...safeAccount,
-      hasTelegramBotToken: Boolean(telegramBotToken),
+      hasTelegramBotToken: Boolean(account.telegramBotToken),
       status: controller?.status || safeAccount.status || 'stopped',
       startedAt: controller?.startedAt || safeAccount.startedAt || null,
       lastError: controller?.lastError || safeAccount.lastError || null,
       conversationCount: controller?.getConversationList().length || safeAccount.conversationCount || 0,
+      qrImageBase64: controller?.qrImageBase64 || null,
+      listenerConnected: Boolean(controller?.listenerConnected),
+      accountName:
+        controller?.zalo?.selfProfile?.displayName ||
+        controller?.zalo?.selfProfile?.zaloName ||
+        safeAccount.label,
     };
   }
 
   async load() {
     const file = await loadAccountsFile(this.baseDir);
     this.accountsFilePath = file.filePath;
-    this.accounts = file.accounts.map((account) => normalizeAccount(account, this.baseDir));
-    if (this.accounts.length === 0) {
+    const registry = await this.loadAccountsRegistry();
+    const savedAccounts = registry?.accounts;
+    this.accounts = (savedAccounts || file.accounts).map((account) => {
+      const configured = file.accounts.find((item) => item.id === account.id);
+      return normalizeAccount(configured ? { ...account, ...configured } : account, this.baseDir);
+    });
+    if (!registry && this.accounts.length === 0) {
       const seeded = createSeedAccountFromEnv(this.baseDir);
       if (seeded) {
         this.accounts = [seeded];
       }
     }
-    if (this.accounts.length > 0) {
-      await this.persist();
-    } else {
-      await this.persist();
-    }
+    await this.persist();
 
     this.state.selectedAccountId = this.accounts[0]?.id || null;
     this.emitState();
@@ -64,7 +87,52 @@ export class BridgeManager extends EventEmitter {
   }
 
   async persist() {
+    if (this.mongoUri) {
+      const collection = await this.ensureAccountsCollection();
+      await collection.replaceOne(
+        { _id: '__accounts_registry__' },
+        {
+          _id: '__accounts_registry__',
+          version: 1,
+          accounts: this.accounts.map((account) => ({
+            id: account.id,
+            label: account.label,
+            telegramForumChatId: account.telegramForumChatId,
+            allowedTelegramUserIds: account.allowedTelegramUserIds,
+            mongoDbName: account.mongoDbName,
+            mongoCollectionName: account.mongoCollectionName,
+            ocrQueueCollectionName: account.ocrQueueCollectionName,
+            zaloLoginMode: account.zaloLoginMode,
+            zaloSelfListen: account.zaloSelfListen,
+            zaloCredentialsFile: account.zaloCredentialsFile,
+            dataFile: account.dataFile,
+            downloadDir: account.downloadDir,
+            localIngestUrl: account.localIngestUrl,
+            localIngestZaloTitle: account.localIngestZaloTitle,
+            autoStart: account.autoStart,
+            enabled: account.enabled,
+          })),
+          updatedAt: new Date().toISOString(),
+        },
+        { upsert: true },
+      );
+      return;
+    }
     await saveAccountsFile(this.baseDir, this.accounts);
+  }
+
+  async ensureAccountsCollection() {
+    if (this.accountsCollection) return this.accountsCollection;
+    if (!this.mongoClient) this.mongoClient = new MongoClient(this.mongoUri);
+    await this.mongoClient.connect();
+    this.accountsCollection = this.mongoClient.db(this.mongoDbName).collection(this.mongoCollectionName);
+    return this.accountsCollection;
+  }
+
+  async loadAccountsRegistry() {
+    if (!this.mongoUri) return null;
+    const collection = await this.ensureAccountsCollection();
+    return collection.findOne({ _id: '__accounts_registry__' });
   }
 
   pushLog(entry) {
@@ -85,7 +153,14 @@ export class BridgeManager extends EventEmitter {
   }
 
   async addAccount(input) {
-    const account = createAccountDraft(input, this.baseDir);
+    const usedIds = new Set(this.accounts.map((item) => item.id));
+    let nextNumber = 1;
+    while (usedIds.has(`zalo-${nextNumber}`)) nextNumber += 1;
+    const account = createAccountDraft(
+      { ...input, id: input.id || `zalo-${nextNumber}`, label: input.label || `Zalo ${nextNumber}` },
+      this.baseDir,
+    );
+    if (usedIds.has(account.id)) throw new Error(`Account ID already exists: ${account.id}`);
     this.accounts = [...this.accounts, account];
     await this.persist();
     this.state.selectedAccountId = account.id;
@@ -105,6 +180,8 @@ export class BridgeManager extends EventEmitter {
   }
 
   async removeAccount(id) {
+    const account = this.getAccount(id);
+    if (!account) throw new Error('Account not found');
     const controller = this.controllers.get(id);
     if (controller) {
       await controller.stop();
@@ -115,6 +192,20 @@ export class BridgeManager extends EventEmitter {
       this.state.selectedAccountId = this.accounts[0]?.id || null;
       this.state.selectedConversationId = null;
     }
+    const accountStore = new Store(account.dataFile, {
+      mongoUri: account.mongoUri,
+      mongoDbName: account.mongoDbName,
+      mongoCollectionName: account.mongoCollectionName,
+      ocrQueueCollectionName: account.ocrQueueCollectionName,
+      accountId: id,
+    });
+    try {
+      await accountStore.load();
+      await accountStore.deleteState();
+    } finally {
+      await accountStore.close();
+    }
+    await fs.rm(account.zaloCredentialsFile, { force: true });
     await this.persist();
     this.emitState();
   }
@@ -152,14 +243,46 @@ export class BridgeManager extends EventEmitter {
       this.emitState();
     });
 
-    controller.on('change', () => this.emitState());
+    controller.on('change', () => {
+      const displayName =
+        controller.zalo?.selfProfile?.displayName ||
+        controller.zalo?.selfProfile?.zaloName ||
+        '';
+      if (displayName && /^Zalo \d+$/i.test(account.label) && account.label !== displayName) {
+        account.label = String(displayName).slice(0, 80);
+        this.persist().catch((error) => this.pushLog({
+          timestamp: new Date().toISOString(),
+          level: 'warn',
+          scope: account.label,
+          message: 'Could not persist Zalo account display name',
+          data: null,
+          error: { name: error?.name || 'Error', message: error?.message || String(error) },
+          accountId: account.id,
+        }));
+      }
+      this.emitState();
+    });
     this.controllers.set(id, controller);
-    const snapshot = await controller.start();
+    controller.start().catch((error) => {
+      this.pushLog({
+        timestamp: new Date().toISOString(),
+        level: 'error',
+        scope: account.label,
+        message: 'Failed to start account',
+        data: null,
+        error: {
+          name: error?.name || 'Error',
+          message: error?.message || String(error),
+          stack: error?.stack || null,
+        },
+        accountId: account.id,
+      });
+    });
     this.state.selectedAccountId = id;
-    const firstConversation = snapshot.conversations[0];
+    const firstConversation = controller.getConversationList()[0];
     this.state.selectedConversationId ||= firstConversation?.conversationId || null;
     this.emitState();
-    return snapshot;
+    return controller.snapshot();
   }
 
   async stopAccount(id) {
@@ -170,31 +293,45 @@ export class BridgeManager extends EventEmitter {
     this.emitState();
   }
 
-  async startAll() {
-    for (const account of this.accounts.filter((item) => item.enabled && item.autoStart)) {
-      try {
-        await this.startAccount(account.id);
-      } catch (error) {
-        this.pushLog({
-          timestamp: new Date().toISOString(),
-          level: 'error',
-          scope: account.label,
-          message: 'Failed to start account',
-          data: null,
-          error: {
-            name: error?.name || 'Error',
-            message: error?.message || String(error),
-            stack: error?.stack || null,
-          },
-          accountId: account.id,
-        });
-      }
+  async reloginAccount(id) {
+    const account = this.getAccount(id);
+    if (!account) throw new Error('Account not found');
+    await this.stopAccount(id);
+
+    const accountStore = new Store(account.dataFile, {
+      mongoUri: account.mongoUri,
+      mongoDbName: account.mongoDbName,
+      mongoCollectionName: account.mongoCollectionName,
+      ocrQueueCollectionName: account.ocrQueueCollectionName,
+      accountId: account.id,
+    });
+    try {
+      await accountStore.load();
+      await accountStore.setCredentials(null);
+    } finally {
+      await accountStore.close();
     }
+    await fs.rm(account.zaloCredentialsFile, { force: true });
+    await this.updateAccount(id, { zaloLoginMode: 'qr' });
+    return this.startAccount(id);
+  }
+
+  async startAll() {
+    await Promise.all(
+      this.accounts
+        .filter((item) => item.enabled && item.autoStart)
+        .map((account) => this.startAccount(account.id)),
+    );
   }
 
   async stopAll() {
     for (const id of [...this.controllers.keys()]) {
       await this.stopAccount(id);
+    }
+    if (this.mongoClient) {
+      await this.mongoClient.close();
+      this.mongoClient = null;
+      this.accountsCollection = null;
     }
   }
 

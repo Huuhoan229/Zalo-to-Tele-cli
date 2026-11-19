@@ -57,15 +57,55 @@ function pickConversationTitle(message, isGroup) {
   );
 }
 
-function normalizeAttachment(content) {
-  if (!content || typeof content !== 'object') return null;
-  const href = content.href || content.thumb || content.previewUrl || content.url;
-  if (!href) return null;
+function parseObject(value) {
+  if (value && typeof value === 'object') return value;
+  if (typeof value !== 'string') return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeAttachment(content, messageType = '') {
+  const value = parseObject(content);
+  if (!value && !/sticker/i.test(String(messageType))) return null;
+  const params = parseObject(value?.params);
+  const sticker = value?.sticker || value?.stickerInfo ||
+    (String(value?.type || '').toLowerCase() === 'sticker' ? value : null) ||
+    (/sticker/i.test(String(messageType)) ? params?.sticker || params || value || {} : null);
+  const href =
+    value?.href ||
+    value?.thumb ||
+    value?.previewUrl ||
+    value?.url ||
+    sticker?.url ||
+    sticker?.href ||
+    sticker?.staticUrl ||
+    sticker?.gifUrl ||
+    sticker?.stickerUrl ||
+    sticker?.stickerWebpUrl;
+  const stickerId = sticker?.stickerId || sticker?.sticker_id || sticker?.id || value?.stickerId || value?.sticker_id;
+  const isSticker = Boolean(sticker || /sticker/i.test(String(messageType)));
+  if (!href && !stickerId && !isSticker) return null;
   return {
-    url: href,
-    title: content.title || content.fileName || 'attachment',
-    raw: content,
+    url: href || null,
+    stickerId: stickerId ? Number(stickerId) || String(stickerId) : null,
+    title: isSticker ? 'sticker' : value?.title || value?.fileName || 'attachment',
+    type: isSticker ? 'sticker' : 'file',
+    raw: value || content,
   };
+}
+
+function quotedMessageText(quote) {
+  if (!quote || typeof quote !== 'object') return '';
+  const content = quote.msg || quote.content;
+  if (typeof content === 'string') return content;
+  if (content && typeof content === 'object') {
+    return content.title || content.text || content.description || '';
+  }
+  return '';
 }
 
 export class ZaloClient extends EventEmitter {
@@ -80,6 +120,7 @@ export class ZaloClient extends EventEmitter {
     this.selfProfile = null;
     this.selfUserId = null;
     this.lastQrPath = null;
+    this.manualStop = false;
     this.heartbeatTimer = null;
     this.ThreadType = ThreadType;
   }
@@ -124,6 +165,7 @@ export class ZaloClient extends EventEmitter {
       await this.loginWithQr(zalo);
     }
 
+    if (this.manualStop) throw new Error('Zalo login cancelled');
     await this.loadSelfProfile();
     this.startHeartbeat();
     this.logger.info('Connected to Zalo');
@@ -138,6 +180,7 @@ export class ZaloClient extends EventEmitter {
         this.selfProfile?.userId ||
         this.selfProfile?.globalId ||
         this.selfProfile?.uid ||
+      this.api.getOwnId?.() ||
         '',
       ) || null;
       this.logger.info(
@@ -157,6 +200,7 @@ export class ZaloClient extends EventEmitter {
     const qrPath = path.join(path.dirname(this.credentialsFile), 'zalo-qr.png');
     this.lastQrPath = qrPath;
     while (true) {
+      if (this.manualStop) throw new Error('Zalo login cancelled');
       try {
         this.api = await zalo.loginQR({ qrPath }, async (event) => {
           if (event.type === LoginQRCallbackEventType.QRCodeGenerated) {
@@ -212,6 +256,7 @@ export class ZaloClient extends EventEmitter {
         });
         return;
       } catch (error) {
+        if (this.manualStop) throw new Error('Zalo login cancelled');
         if (this.logger) this.logger.warn({ error }, 'Zalo QR login attempt failed.');
         if (!isRecoverableQrLoginError(error)) throw error;
         if (!this.lastQrPath) throw error;
@@ -251,10 +296,11 @@ export class ZaloClient extends EventEmitter {
       }
     });
 
-    this.api.listener.start({ retryOnClose: true });
+    this.api.listener.start({ retryOnClose: false });
   }
 
   stop() {
+    this.manualStop = true;
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
@@ -278,7 +324,15 @@ export class ZaloClient extends EventEmitter {
 
   async normalizeMessage(message) {
     const content = message.data?.content;
-    const attachment = normalizeAttachment(content);
+    const attachment = normalizeAttachment(content, message.data?.msgType);
+    if (attachment?.type === 'sticker' && attachment.stickerId && !attachment.url) {
+      try {
+        const detail = (await this.api.getStickersDetail(attachment.stickerId))?.[0];
+        attachment.url = detail?.stickerUrl || detail?.stickerWebpUrl || null;
+      } catch (error) {
+        this.logger.debug({ error, stickerId: attachment.stickerId }, 'Could not resolve Zalo sticker image.');
+      }
+    }
     const isGroup = message.type === ThreadType.Group;
     const isSelf = Boolean(
       message.isSelf ||
@@ -293,7 +347,13 @@ export class ZaloClient extends EventEmitter {
       isSelf,
       senderName: isSelf ? 'Tôi' : pickSenderName(message),
       title: await this.resolveConversationTitle(message, isGroup, isSelf),
-      text: pickText(content),
+      text: attachment?.type === 'sticker' ? '' : pickText(content),
+      replyTo: message.data?.quote
+        ? {
+            senderName: message.data.quote.fromD || message.data.quote.dName || message.data.quote.senderName || '',
+            text: quotedMessageText(message.data.quote),
+          }
+        : null,
       attachment,
       raw: message,
     };
@@ -316,16 +376,17 @@ export class ZaloClient extends EventEmitter {
     return pickConversationTitle(message, true);
   }
 
-  async sendText({ conversationId, threadType, text }) {
+  async sendText({ conversationId, threadType, text, quote = null }) {
     if (!this.api) throw new Error('Zalo is not connected');
-    await this.api.sendMessage({ msg: text }, conversationId, threadType);
+    await this.api.sendMessage({ msg: text, ...(quote ? { quote } : {}) }, conversationId, threadType);
   }
 
-  async sendImage({ conversationId, threadType, filePath, caption }) {
+  async sendImage({ conversationId, threadType, filePath, caption, quote = null }) {
     if (!this.api) throw new Error('Zalo is not connected');
     const payload = {
       msg: caption || '',
       attachments: [path.resolve(filePath)],
+      ...(quote ? { quote } : {}),
     };
     await this.api.sendMessage(payload, conversationId, threadType);
   }

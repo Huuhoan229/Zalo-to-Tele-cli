@@ -61,6 +61,11 @@ export class BridgeController extends EventEmitter {
     this.emitChange();
 
     await this.ready;
+    if (this.manualStop) {
+      this.status = 'stopped';
+      this.emitChange();
+      return this.snapshot();
+    }
 
     try {
       this.zalo = new ZaloClient({
@@ -94,6 +99,12 @@ export class BridgeController extends EventEmitter {
       });
 
       await this.zalo.connect();
+      if (this.manualStop) {
+        this.zalo.stop();
+        this.status = 'stopped';
+        this.emitChange();
+        return this.snapshot();
+      }
 
       this.telegram = new TelegramBridgeBot({
         config: {
@@ -171,6 +182,11 @@ export class BridgeController extends EventEmitter {
       this.emitChange();
       return this.snapshot();
     } catch (error) {
+      if (this.manualStop) {
+        this.status = 'stopped';
+        this.emitChange();
+        return this.snapshot();
+      }
       this.status = 'error';
       this.lastError = error?.message || String(error);
       this.qrImageBase64 = null;
@@ -271,6 +287,8 @@ export class BridgeController extends EventEmitter {
       senderName: entry.senderName,
       text: cleanMessageText(entry.text),
       attachment: entry.attachment || null,
+      telegramMessageId: entry.telegramMessageId ?? null,
+      replyData: entry.replyData || null,
       topicId: mapping.topicId,
       threadType: mapping.threadType,
       createdAt: entry.createdAt,

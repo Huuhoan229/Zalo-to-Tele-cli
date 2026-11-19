@@ -131,6 +131,14 @@ export class Store {
     this.ocrQueueCollection = null;
   }
 
+  async deleteState() {
+    if (this.useMongo) {
+      const collection = await this.ensureMongo();
+      await collection.deleteOne({ _id: this.accountId });
+    }
+    await fs.rm(this.filePath, { force: true });
+  }
+
   getByConversation(conversationId) {
     return this.state.conversations[String(conversationId)] || null;
   }
@@ -188,6 +196,14 @@ export class Store {
   async appendMessage(conversationId, message) {
     const key = String(conversationId);
     const items = this.state.messages[key] || [];
+    const messageId = String(message.id || '');
+    const existing = messageId ? items.find((item) => String(item.id) === messageId) : null;
+    if (existing) {
+      if (message.telegramMessageId) existing.telegramMessageId = Number(message.telegramMessageId);
+      if (message.replyData) existing.replyData = structuredClone(message.replyData);
+      await this.save();
+      return existing;
+    }
     const entry = {
       id: message.id || crypto.randomUUID(),
       direction: message.direction || 'in',
@@ -198,6 +214,8 @@ export class Store {
       createdAt: message.createdAt || new Date().toISOString(),
       topicId: message.topicId ?? null,
       threadType: message.threadType ?? null,
+      telegramMessageId: message.telegramMessageId ? Number(message.telegramMessageId) : null,
+      replyData: message.replyData ? structuredClone(message.replyData) : null,
     };
 
     items.push(entry);
@@ -212,6 +230,18 @@ export class Store {
 
     await this.save();
     return entry;
+  }
+
+  getReplyData(telegramMessageId) {
+    const target = String(telegramMessageId ?? '');
+    if (!target) return null;
+    for (const items of Object.values(this.state.messages)) {
+      for (let index = items.length - 1; index >= 0; index -= 1) {
+        const item = items[index];
+        if (String(item.telegramMessageId ?? '') === target) return item.replyData || null;
+      }
+    }
+    return null;
   }
 
   async enqueueOcrMessage(message) {
