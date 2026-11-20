@@ -2,6 +2,8 @@
 
 Bridge one or more personal Zalo accounts to one Telegram forum group.
 
+Current deployment: this bridge runs on **Koyeb** with **MongoDB**; the separate `9router-tele-render` repository runs on **Render** as the AI API. Keep the two existing services. Render deployment for this bridge is an optional alternative.
+
 > This project uses `zca-js`, an unofficial Zalo Web API. It can break if Zalo changes behavior and may trigger session restrictions.
 
 ## What It Does
@@ -10,7 +12,7 @@ Bridge one or more personal Zalo accounts to one Telegram forum group.
 - Sends Telegram replies, photos, and image documents back to the correct Zalo conversation.
 - Creates one Telegram topic per Zalo conversation.
 - Supports multiple Zalo accounts with one Telegram bot and one Telegram forum group.
-- Stores Zalo sessions and Telegram topic mappings in MongoDB, so Render redeploys do not wipe the bridge state.
+- Stores Zalo sessions and Telegram topic mappings in MongoDB across Koyeb or Render redeploys.
 - Queues matched Zalo messages into MongoDB for a separate local OCR worker.
 - Provides a private Telegram management menu for AI chat, Zalo QR login, status, and AI auto-reply mode.
 
@@ -67,21 +69,21 @@ Put each authorized Telegram user ID in `ALLOWED_TELEGRAM_USER_IDS`. An empty al
 
 ### Allow Telegram replies to reach Zalo
 
-In the Render dashboard, open the service's **Environment** settings and set:
+In Koyeb, open the bridge service's **Settings → Environment variables and files**. If hosting this bridge on Render instead, use its **Environment** settings. Set:
 
 ```env
 ALLOWED_TELEGRAM_USER_IDS=123456789
 ```
 
-Find your numeric Telegram user ID by sending `/id` in the forum group. For multiple users, use a comma-separated list. Save the changes and redeploy the Render service. This deployment variable overrides any older allowlist value saved in the MongoDB account registry.
+Find your numeric Telegram user ID by sending `/id` in the forum group. For multiple users, use a comma-separated list. Save the changes and redeploy the bridge service. This deployment variable overrides any older allowlist value saved in the MongoDB account registry.
 
 To send a Zalo message, send text in the Telegram forum topic linked to that Zalo conversation. Photos and image documents are also forwarded. The Telegram bot and mapped Zalo account must both be running. If sending fails, the bot replies in the topic with the permission or delivery error.
 
-If a message does not reach Zalo, check that it is in the correct mapped topic, the Zalo account is running, and your numeric Telegram user ID is included in `ALLOWED_TELEGRAM_USER_IDS`. Use `/topics` to inspect topic mappings and `/id` to check the sender ID. Render's service logs show delivery errors; the bot also replies with the returned error in the topic.
+If a message does not reach Zalo, check that it is in the correct mapped topic, the Zalo account is running, and your numeric Telegram user ID is included in `ALLOWED_TELEGRAM_USER_IDS`. Use `/topics` to inspect topic mappings and `/id` to check the sender ID. The bridge service logs show delivery errors; the bot also replies with the returned error in the topic.
 
 ## MongoDB Setup
 
-MongoDB is recommended for Render Free because the service filesystem is ephemeral.
+Keep the existing MongoDB connection when updating the Koyeb deployment. MongoDB also provides persistent bridge state if this app is hosted on Render Free.
 
 MongoDB stores:
 
@@ -103,7 +105,7 @@ TRANSCRIPT_FULL_RETENTION_DAYS=1
 TRANSCRIPT_RETENTION_DAYS=7
 ```
 
-If MongoDB Atlas cannot connect from Render, check the Atlas Network Access/IP allowlist.
+If MongoDB Atlas cannot connect from the bridge host, check the Atlas Network Access/IP allowlist.
 
 ## Single Zalo Account
 
@@ -155,7 +157,7 @@ Pretty JSON:
 ]
 ```
 
-Paste the `ACCOUNTS_JSON` value as one line in the Render environment settings:
+Paste the `ACCOUNTS_JSON` value as one line in the bridge service's environment settings:
 
 ```env
 ACCOUNTS_JSON=[{"id":"zalo-1","label":"Zalo 1","zaloLoginMode":"qr","localIngestZaloTitle":"nhom 2"},{"id":"zalo-2","label":"Zalo 2","zaloLoginMode":"qr","localIngestZaloTitle":"nhom 2"}]
@@ -190,7 +192,24 @@ Per-account optional fields:
 }
 ```
 
-## Render Deployment
+## Koyeb Bridge + Render 9Router (Current Setup)
+
+Keep `Zalo-to-Tele-cli` on the existing Koyeb Web Service with build command `npm ci` and run command `npm start`. Use `/healthz` for the health check and retain the existing port configuration.
+
+In Koyeb **Settings → Environment variables and files**, add:
+
+```env
+TELEGRAM_ADMIN_IDS=your_numeric_telegram_user_id
+AI_BASE_URL=https://your-9router-service.onrender.com/v1
+AI_API_KEY=your_9router_api_key
+AI_MODEL=your_model_or_combo
+```
+
+Keep the existing `MONGODB_URI`, database/collection names, Telegram forum ID, Telegram-to-Zalo allowlist, account IDs, OCR settings, and `WEB_ACCESS_TOKEN`. Keep the Telegram bot token in this Koyeb service; update it here if rotating the token. Open `https://your-bridge.koyeb.app/?token=YOUR_WEB_ACCESS_TOKEN` for web QR login, or use `/menu` in a private chat with the management bot.
+
+On the Render service running `9router-tele-render`, remove or clear `TELEGRAM_BOT_TOKEN` to disable its old Telegram listener. Keep its existing 9Router configuration, API keys, and Gist backup settings. It does not need a new MongoDB configuration.
+
+## Render Deployment (Optional Alternative for the Bridge)
 
 Deploy this repository as a Render Web Service using the included `render.yaml` Blueprint.
 
@@ -311,7 +330,7 @@ Open a private chat with the bot and use `/start` or `/menu`. The menu provides:
 - `Bật/tắt AI Zalo`: opens the account list; each account has an AI toggle between `dm` and `off`.
 - `Trạng thái`: shows the Zalo listener and current AI mode.
 
-Set `TELEGRAM_ADMIN_IDS` to the administrator Telegram ID(s). Use `/id` to look up an ID, then add it in Render's Environment settings and redeploy. Admins can grant AI-only access to other IDs with `/allowai <telegram_user_id>`, revoke it with `/denyai <telegram_user_id>`, and list it with `/aiusers`. `ALLOWED_TELEGRAM_USER_IDS` still controls who can send messages from Telegram topics back to Zalo; keep these two lists separate if needed.
+Set `TELEGRAM_ADMIN_IDS` to the administrator Telegram ID(s). Use `/id` to look up an ID, then add it in the bridge service's environment settings on Koyeb (or Render if hosting the bridge there) and redeploy. Admins can grant AI-only access to other IDs with `/allowai <telegram_user_id>`, revoke it with `/denyai <telegram_user_id>`, and list it with `/aiusers`. `ALLOWED_TELEGRAM_USER_IDS` still controls who can send messages from Telegram topics back to Zalo; keep these two lists separate if needed.
 
 Configure the AI service with:
 
@@ -324,9 +343,9 @@ AI_SYSTEM_PROMPT=Bạn là trợ lý hữu ích. Trả lời bằng ngôn ngữ 
 
 The bot supports `/ask <câu hỏi>` and `/zaloai off|command|dm|all [account_id]`. In `command` mode, Zalo replies require `/ask`, `/ai`, or an explicit group mention; `dm` also replies to private chats; `all` replies to all incoming text messages and images. AI defaults to `off` for each Zalo account. Image analysis requires a model with vision support. AI chat history and AI access permissions are stored in a dedicated MongoDB control record; each account's Zalo AI mode stays with that account's bridge record.
 
-### Keep the two Render deployments
+### Keep Koyeb and Render as separate deployments
 
-The bridge and 9Router can remain separate Render services. Set `AI_BASE_URL` to the 9Router service URL ending in `/v1`, then set its API key and model in the bridge service. Keep the Telegram bot token only in this bridge service. To use the 9Router service only as the AI API, remove `TELEGRAM_BOT_TOKEN` from its Environment settings; this prevents two services polling updates for the same bot. The 9Router service can keep its existing GitHub Gist backup for its SQLite data.
+The bridge runs on Koyeb and calls 9Router on Render over its public HTTPS API. In the Koyeb bridge service, set `AI_BASE_URL` to the Render 9Router URL ending in `/v1`, then set its API key and model. Keep the Telegram bot token only in the Koyeb bridge service. To use the Render 9Router service only as the AI API, remove `TELEGRAM_BOT_TOKEN` from its Environment settings; this prevents two services polling updates for the same bot. The 9Router service keeps its existing GitHub Gist backup for its SQLite data.
 
 ## OCR Queue
 

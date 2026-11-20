@@ -796,7 +796,7 @@ export class TelegramBridgeBot {
     if (!ctx.message.message_thread_id) return;
     if (!isAllowed(this.config, ctx.from.id)) {
       await ctx.reply(
-        'Bạn chưa được cấp quyền gửi sang Zalo. Telegram user ID của bạn là ' + ctx.from?.id + '. Thêm ID này vào ALLOWED_TELEGRAM_USER_IDS trong Environment settings của Render rồi redeploy.',
+        'Bạn chưa được cấp quyền gửi sang Zalo. Telegram user ID của bạn là ' + ctx.from?.id + '. Thêm ID này vào ALLOWED_TELEGRAM_USER_IDS trong biến môi trường của service bridge (Koyeb/Render) rồi redeploy.',
       );
       return;
     }
@@ -837,7 +837,7 @@ export class TelegramBridgeBot {
     }
     if (!isAllowed(this.config, ctx.from.id)) {
       await ctx.reply(
-        'Bạn chưa được cấp quyền gửi sang Zalo. Telegram user ID của bạn là ' + ctx.from?.id + '. Thêm ID này vào ALLOWED_TELEGRAM_USER_IDS trong Environment settings của Render rồi redeploy.',
+        'Bạn chưa được cấp quyền gửi sang Zalo. Telegram user ID của bạn là ' + ctx.from?.id + '. Thêm ID này vào ALLOWED_TELEGRAM_USER_IDS trong biến môi trường của service bridge (Koyeb/Render) rồi redeploy.',
       );
       return;
     }
@@ -902,7 +902,7 @@ export class TelegramBridgeBot {
     }
     if (!isAllowed(this.config, ctx.from.id)) {
       await ctx.reply(
-        'Bạn chưa được cấp quyền gửi sang Zalo. Telegram user ID của bạn là ' + ctx.from?.id + '. Thêm ID này vào ALLOWED_TELEGRAM_USER_IDS trong Environment settings của Render rồi redeploy.',
+        'Bạn chưa được cấp quyền gửi sang Zalo. Telegram user ID của bạn là ' + ctx.from?.id + '. Thêm ID này vào ALLOWED_TELEGRAM_USER_IDS trong biến môi trường của service bridge (Koyeb/Render) rồi redeploy.',
       );
       return;
     }
