@@ -60,6 +60,7 @@ export class BridgeController extends EventEmitter {
     this.clearRestartTimer();
     this.startHealthTimer();
     this.status = 'starting';
+    this.listenerConnected = false;
     this.lastError = null;
     this.emitChange();
 
@@ -92,6 +93,13 @@ export class BridgeController extends EventEmitter {
       this.zalo.on('qrExpired', () => {
         this.qrPath = null;
         this.qrImageBase64 = null;
+        this.emit('qrExpired');
+        this.emitChange();
+      });
+      this.zalo.on('qrDeclined', () => {
+        this.qrPath = null;
+        this.qrImageBase64 = null;
+        this.emit('qrDeclined');
         this.emitChange();
       });
       this.zalo.on('credentialsSaved', ({ credentialsFile }) => {
@@ -215,6 +223,7 @@ export class BridgeController extends EventEmitter {
       this.zalo?.stop();
     } finally {
       this.status = 'stopped';
+      this.listenerConnected = false;
       this.emitChange();
       await this.store.close();
     }

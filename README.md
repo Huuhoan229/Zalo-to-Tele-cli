@@ -330,6 +330,8 @@ Open a private chat with the bot and use `/start` or `/menu`. The menu provides:
 - `Bật/tắt AI Zalo`: opens the account list; each account has an AI toggle between `dm` and `off`.
 - `Trạng thái`: shows the Zalo listener and current AI mode.
 
+When you request QR login, add an account, or start an account from Telegram, the bot reports QR scan/phone confirmation, QR expiry or rejection, login failure, and successful connection in the requesting admin's private chat. Success is sent once the bridge is running and the Zalo listener is connected; it includes the account ID, current AI mode, and MongoDB session storage status. If readiness is still unconfirmed after five minutes, the bot asks you to check `/zalostatus` or request a new QR.
+
 Set `TELEGRAM_ADMIN_IDS` to the administrator Telegram ID(s). Use `/id` to look up an ID, then add it in the bridge service's environment settings on Koyeb (or Render if hosting the bridge there) and redeploy. Admins can grant AI-only access to other IDs with `/allowai <telegram_user_id>`, revoke it with `/denyai <telegram_user_id>`, and list it with `/aiusers`. `ALLOWED_TELEGRAM_USER_IDS` still controls who can send messages from Telegram topics back to Zalo; keep these two lists separate if needed.
 
 Configure the AI service with:

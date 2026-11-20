@@ -250,6 +250,39 @@ class SharedTelegramRuntime {
         caption: 'Quét QR bằng ứng dụng Zalo trên điện thoại để kết nối tài khoản.',
       });
     };
+    const loginCallbacks = (ctx) => ({
+      onQr: (image) => sendQr(ctx.chat.id, image),
+      onStatus: async (event) => {
+        const account = `${event.accountName} [${event.accountId}]`;
+        let text;
+        switch (event.type) {
+          case 'scanned':
+            text = `👀 Đã nhận quét QR từ Zalo: ${event.scannedName || event.accountName}!\nTài khoản quản lý: ${event.accountId}\n👉 Hãy xác nhận đăng nhập trên điện thoại.`;
+            break;
+          case 'success':
+            text = `✅ Kết nối Zalo thành công!\n• Tài khoản: ${account}\n• Trạng thái: running (đang nghe tin)\n• AI tự trả lời: ${event.mode}${event.mode === 'off' ? ' (đã tắt)' : ''}\n${event.savedToMongo ? '• Phiên đăng nhập đã được lưu vào MongoDB.' : '• Phiên đăng nhập được lưu trong dữ liệu bridge.'}`;
+            break;
+          case 'expired':
+            text = `⌛ QR của ${account} đã hết hạn. Bot đang chờ mã QR mới; hãy quét mã mới nhất.`;
+            break;
+          case 'declined':
+            text = `⚠️ Đăng nhập ${account} đã bị từ chối trên điện thoại. Hãy quét QR mới và xác nhận lại.`;
+            break;
+          case 'reconnecting':
+            text = `🔄 ${account} đang kết nối lại. Chưa xác nhận kết nối thành công.`;
+            break;
+          case 'stopped':
+            text = `⏸ Đã dừng kết nối ${account}. Phiên đăng nhập đang chờ đã kết thúc.`;
+            break;
+          case 'timeout':
+            text = `⌛ Chưa xác nhận kết nối ${account} sau 5 phút. Dùng /zalostatus để kiểm tra hoặc /zaloqr ${event.accountId} để thử lại.`;
+            break;
+          default:
+            text = `❌ Không kết nối được ${account}.\n${humanError(event.error)}\nDùng /zaloqr ${event.accountId} để thử lại.`;
+        }
+        await this.bot.telegram.sendMessage(ctx.chat.id, text);
+      },
+    });
     const requireAdmin = async (ctx, action) => {
       if (!isAdmin(ctx)) return deny(ctx);
       if (ctx.chat?.type !== 'private') {
@@ -267,7 +300,8 @@ class SharedTelegramRuntime {
           const accountId = /^\/zaloqr(?:@\w+)?(?:\s|$)/i.test(text)
             ? text.split(/\s+/)[1] || null
             : null;
-          await this.manager.requestZaloQr((image) => sendQr(ctx.chat.id, image), accountId);
+          const callbacks = loginCallbacks(ctx);
+          await this.manager.requestZaloQr(callbacks.onQr, accountId, callbacks.onStatus);
         } catch (error) {
           await ctx.reply(`Không khởi tạo được QR Zalo: ${humanError(error)}`);
         }
@@ -301,8 +335,9 @@ class SharedTelegramRuntime {
         if (!this.manager) return ctx.reply('Quản lý Zalo chưa khởi động.');
         await ctx.reply('Đang tạo tài khoản Zalo mới, QR sẽ được gửi vào đây khi sẵn sàng.');
         try {
-          const account = await this.manager.addZaloAccount(label, (image) => sendQr(ctx.chat.id, image));
-          await ctx.reply(`Đã tạo tài khoản ${account.label} (${account.id}). Quét QR vừa được gửi để đăng nhập.`);
+          const callbacks = loginCallbacks(ctx);
+          const account = await this.manager.addZaloAccount(label, callbacks.onQr, callbacks.onStatus);
+          await ctx.reply(`Đã tạo mục tài khoản ${account.label} (${account.id}). Đang chờ đăng nhập; bot sẽ gửi QR và thông báo khi kết nối thành công.`);
         } catch (error) {
           await ctx.reply(`Không tạo được tài khoản Zalo: ${humanError(error)}`);
         }
@@ -363,7 +398,11 @@ class SharedTelegramRuntime {
       if (ctx.chat?.type !== 'private') return ctx.reply('Dùng lệnh này trong chat riêng với bot.');
       const id = ctx.message.text.split(/\s+/)[1];
       if (!id) return ctx.reply('Dùng /zalostart <account_id>');
-      try { await this.manager.startManagedAccount(id); await showStatus(ctx); }
+      try {
+        const callbacks = loginCallbacks(ctx);
+        await this.manager.startManagedAccount(id, callbacks.onQr, callbacks.onStatus);
+        await showStatus(ctx);
+      }
       catch (error) { await ctx.reply(`Không khởi động được tài khoản: ${humanError(error)}`); }
     });
     this.bot.command('zalostop', async (ctx) => {
@@ -397,7 +436,8 @@ class SharedTelegramRuntime {
       await ctx.answerCbQuery();
       try {
         await ctx.reply('Đang yêu cầu QR đăng nhập lại.');
-        await this.manager.requestZaloQr((image) => sendQr(ctx.chat.id, image), ctx.match[1]);
+        const callbacks = loginCallbacks(ctx);
+        await this.manager.requestZaloQr(callbacks.onQr, ctx.match[1], callbacks.onStatus);
       } catch (error) { await ctx.reply(`Không tạo được QR: ${humanError(error)}`); }
     });
     for (const operation of ['start', 'stop']) {
@@ -405,8 +445,12 @@ class SharedTelegramRuntime {
         if (!isAdmin(ctx) || ctx.chat?.type !== 'private') return ctx.answerCbQuery('Chỉ admin được dùng trong chat riêng với bot.');
         await ctx.answerCbQuery();
         try {
-          if (operation === 'start') await this.manager.startManagedAccount(ctx.match[1]);
-          else await this.manager.stopManagedAccount(ctx.match[1]);
+          if (operation === 'start') {
+            const callbacks = loginCallbacks(ctx);
+            await this.manager.startManagedAccount(ctx.match[1], callbacks.onQr, callbacks.onStatus);
+          } else {
+            await this.manager.stopManagedAccount(ctx.match[1]);
+          }
           await showStatus(ctx);
         } catch (error) { await ctx.reply(`Không cập nhật được tài khoản: ${humanError(error)}`); }
       });

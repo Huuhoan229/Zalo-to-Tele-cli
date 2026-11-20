@@ -7,6 +7,7 @@ import { createLogger } from './logger.js';
 import { BridgeController } from './bridgeController.js';
 import { Store } from './store.js';
 import { completeChat } from './ai.js';
+import { observeZaloLogin } from './loginNotifications.js';
 import {
   createAccountDraft,
   loadAccountsFile,
@@ -242,7 +243,9 @@ export class BridgeManager extends EventEmitter {
     const account = this.getAccount(id);
     if (!account) throw new Error('Account not found');
     if (this.controllers.has(id)) {
-      return this.controllers.get(id).snapshot();
+      const controller = this.controllers.get(id);
+      onController?.(controller);
+      return controller.snapshot();
     }
 
     const controller = new BridgeController(account, {
@@ -434,31 +437,33 @@ export class BridgeManager extends EventEmitter {
     return this.withControlStore((store) => store.clearTelegramAiHistory(userId));
   }
 
-  async requestZaloQr(onQr, accountId = null) {
+  async requestZaloQr(onQr, accountId = null, onStatus = null) {
     const account = accountId
       ? this.getAccount(accountId)
       : this.accounts.find((item) => item.enabled) || this.accounts[0];
     if (!account) throw new Error('Chưa có tài khoản Zalo.');
     await this.reloginAccount(account.id, {
       onController: (controller) => {
-        controller.on('qr', (event) => onQr(event.qrImageBase64));
+        observeZaloLogin(controller, { onQr, onStatus });
       },
     });
   }
 
-  async addZaloAccount(label, onQr) {
+  async addZaloAccount(label, onQr, onStatus = null) {
     const account = await this.addAccount({ label: String(label || '').trim() || undefined });
     await this.startAccount(account.id, {
       onController: (controller) => {
-        controller.on('qr', (event) => onQr(event.qrImageBase64));
+        observeZaloLogin(controller, { onQr, onStatus });
       },
     });
     return account;
   }
 
-  async startManagedAccount(id) {
+  async startManagedAccount(id, onQr, onStatus) {
     await this.updateAccount(id, { autoStart: true, enabled: true });
-    return this.startAccount(id);
+    return this.startAccount(id, {
+      onController: (controller) => observeZaloLogin(controller, { onQr, onStatus }),
+    });
   }
 
   async stopManagedAccount(id) {

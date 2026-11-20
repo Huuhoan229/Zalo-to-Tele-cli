@@ -12,6 +12,7 @@ import { completeChat } from '../src/ai.js';
 test('Telegram menu routes QR, permissions, and forum replies through one runtime', async () => {
   const sent = [];
   const qrRequests = [];
+  const loginStatuses = [];
   const zaloSent = [];
   const mapping = { conversationId: 'zalo-chat', threadType: 1, topicId: 17 };
   const bridge = new TelegramBridgeBot({
@@ -26,7 +27,7 @@ test('Telegram menu routes QR, permissions, and forum replies through one runtim
   const runtime = bridge.runtime;
   runtime.manager = {
     isAiUserAllowed: async (id) => id === 222,
-    requestZaloQr: async (_onQr, id) => qrRequests.push(id),
+    requestZaloQr: async (_onQr, id, onStatus) => { qrRequests.push(id); loginStatuses.push(onStatus); },
     chatWithAi: async (_id, prompt) => `AI: ${prompt}`,
   };
   runtime.addBridge(bridge);
@@ -57,6 +58,15 @@ test('Telegram menu routes QR, permissions, and forum replies through one runtim
   await dispatch('🔗 Kết nối Zalo');
   await dispatch('/zaloqr zalo-2');
   assert.deepEqual(qrRequests, [null, 'zalo-2']);
+  const notifications = [];
+  runtime.bot.telegram.sendMessage = async (chatId, text) => notifications.push({ chatId, text });
+  await loginStatuses.at(-1)({ type: 'scanned', accountId: 'zalo-2', accountName: 'HJ', scannedName: 'HJ' });
+  await loginStatuses.at(-1)({ type: 'success', accountId: 'zalo-2', accountName: 'HJ', mode: 'off', savedToMongo: true });
+  assert.equal(notifications[0].chatId, 111);
+  assert.match(notifications[0].text, /xác nhận đăng nhập/);
+  assert.match(notifications[1].text, /Kết nối Zalo thành công/);
+  assert.match(notifications[1].text, /AI tự trả lời: off \(đã tắt\)/);
+  assert.match(notifications[1].text, /MongoDB/);
   await dispatch('🔗 Kết nối Zalo', 222);
   assert.equal(qrRequests.length, 2);
   assert.match(sent.at(-1).text, /Chưa được cấp quyền/);
