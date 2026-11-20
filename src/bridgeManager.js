@@ -62,6 +62,7 @@ export class BridgeManager extends EventEmitter {
       qrImageBase64: controller?.qrImageBase64 || null,
       listenerConnected: Boolean(controller?.listenerConnected),
       lastAiError: controller?.lastAiError || null,
+      lastTelegramError: controller?.lastTelegramError || null,
       lastAiReplyAt: controller?.lastAiReplyAt || null,
       accountName:
         controller?.zalo?.selfProfile?.displayName ||
@@ -273,6 +274,7 @@ export class BridgeManager extends EventEmitter {
       this.emitState();
     });
     controller.on('aiError', (event) => this.emit('aiError', event));
+    controller.on('telegramError', (event) => this.emit('telegramError', event));
 
     controller.on('change', () => {
       const displayName =

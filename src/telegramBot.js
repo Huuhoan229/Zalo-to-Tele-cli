@@ -3,6 +3,7 @@ import { Input, Markup, Telegraf } from 'telegraf';
 import { message } from 'telegraf/filters';
 import fs from 'node:fs/promises';
 import { ensureDir, uniqueDownloadPath } from './media.js';
+import { boundTelegramApi, BoundedTelegramContext, normalizedMenuText } from './telegramTransport.js';
 
 const runtimes = new Map();
 
@@ -33,7 +34,7 @@ async function telegramPhotoDataUrl(ctx) {
   const photo = ctx.message?.photo?.at(-1);
   if (!photo) throw new Error('Không tìm thấy ảnh Telegram.');
   const link = await ctx.telegram.getFileLink(photo.file_id);
-  const response = await fetch(link);
+  const response = await fetch(link, { signal: AbortSignal.timeout(20000) });
   if (!response.ok) throw new Error(`Không tải được ảnh Telegram: HTTP ${response.status}`);
   const mime = response.headers.get('content-type') || 'image/jpeg';
   const buffer = Buffer.from(await response.arrayBuffer());
@@ -58,6 +59,12 @@ function isAllowed(config, userId) {
 function isTelegramThreadNotFound(error) {
   const description = String(error?.response?.description || error?.description || error?.message || '');
   return error?.response?.error_code === 400 && /message thread not found/i.test(description);
+}
+
+function isTelegramDestinationError(error) {
+  const code = error?.response?.error_code;
+  const description = String(error?.response?.description || error?.message || '');
+  return (code === 400 || code === 403) && /chat not found|bot was kicked|bot is not a member|not enough rights|need administrator|CHAT_ADMIN_REQUIRED|forbidden/i.test(description);
 }
 
 function formatZaloMessage(zaloMessage) {
@@ -102,7 +109,7 @@ class SharedTelegramRuntime {
   constructor(config, logger) {
     this.config = config;
     this.logger = logger;
-    this.bot = new Telegraf(config.telegramBotToken);
+    this.bot = this.createBot();
     this.bridges = new Set();
     this.handlersRegistered = false;
     this.started = false;
@@ -112,6 +119,14 @@ class SharedTelegramRuntime {
     this.manager = null;
     this.controlStarted = false;
     this.pendingSettings = new Map();
+    this.pollingTask = null;
+    this.retryTimer = null;
+    this.retryCount = 0;
+    this.generation = 0;
+    this.lastTransportError = null;
+    this.lastUpdateAt = null;
+    this.transportStatus = 'stopped';
+    this.aiJobs = new Map();
     // Webhook mode: đọc TELEGRAM_WEBHOOK_URL từ env (setting toàn deployment).
     // Nếu không set → fallback về long polling (chạy local).
     const webhookBaseUrl = process.env.TELEGRAM_WEBHOOK_URL?.trim().replace(/\/$/, '') || '';
@@ -123,9 +138,72 @@ class SharedTelegramRuntime {
     return Boolean(this.webhookBaseUrl && this.webhookPath);
   }
 
+  createBot() {
+    const bot = new Telegraf(this.config.telegramBotToken, { contextType: BoundedTelegramContext, handlerTimeout: 25000 });
+    boundTelegramApi(bot.telegram);
+    return bot;
+  }
+
+  snapshot() {
+    return {
+      status: this.transportStatus,
+      mode: this.isWebhookMode ? 'webhook' : 'polling',
+      lastError: this.lastTransportError,
+      lastUpdateAt: this.lastUpdateAt,
+      retryCount: this.retryCount,
+      aiJobs: this.aiJobs.size,
+      version: (process.env.KOYEB_GIT_SHA || process.env.RENDER_GIT_COMMIT || '').slice(0, 7) || 'local',
+    };
+  }
+
+  stopTransport(reason = 'manual') {
+    this.generation += 1;
+    clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+    if (this.isWebhookMode) {
+      webhookHandlers.delete(this.webhookPath);
+      this.bot.telegram.deleteWebhook().catch(() => {});
+    } else {
+      try { this.bot.stop(reason); } catch { /* launch may still be awaiting getMe */ }
+    }
+    this.started = false;
+    this.transportStatus = 'stopped';
+  }
+
+  scheduleReconnect(error, generation = this.generation) {
+    if (generation !== this.generation || this.retryTimer || (!this.controlStarted && this.bridges.size === 0)) return;
+    this.started = false;
+    this.lastTransportError = humanError(error);
+    const code = error?.response?.error_code || error?.code;
+    if (code === 401 || code === 404) {
+      this.transportStatus = 'invalid-token';
+      this.logger.error({ error: this.lastTransportError }, 'Telegram bot token was rejected; update TELEGRAM_BOT_TOKEN.');
+      return;
+    }
+    this.transportStatus = 'reconnecting';
+    const delay = Math.min(2000 * (2 ** this.retryCount), 60000);
+    this.retryCount += 1;
+    this.logger.warn({ error: this.lastTransportError, retryInMs: delay }, 'Telegram transport stopped; scheduling reconnect.');
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      this.start().catch((nextError) => this.scheduleReconnect(nextError));
+    }, delay);
+    this.retryTimer.unref?.();
+  }
+
+  async runAiJob(ctx, action) {
+    const key = String(ctx.from.id);
+    if (this.aiJobs.has(key)) return ctx.reply('AI đang xử lý yêu cầu trước. Bạn vẫn có thể dùng /menu hoặc /ping.');
+    // Return the update promptly so long polling can fetch management commands.
+    const task = Promise.resolve().then(action).catch(async (error) => {
+      await ctx.reply(`Không gọi được AI: ${humanError(error)}`).catch(() => {});
+    }).finally(() => { this.aiJobs.delete(key); });
+    this.aiJobs.set(key, task);
+  }
+
   _recreateBot() {
     // Tạo mới Telegraf instance để tránh state cũ gây lỗi sau khi stop.
-    this.bot = new Telegraf(this.config.telegramBotToken);
+    this.bot = this.createBot();
     this.handlersRegistered = false;
     // Cập nhật lại reference bot cho tất cả bridges đang dùng runtime này.
     for (const bridge of this.bridges) {
@@ -140,15 +218,8 @@ class SharedTelegramRuntime {
 
   removeBridge(bridge, reason = 'manual') {
     this.bridges.delete(bridge);
-    if (this.bridges.size === 0 && this.started && !this.controlStarted) {
-      if (this.isWebhookMode) {
-        // Xoá webhook handler khỏi registry và notify Telegram xoá webhook.
-        webhookHandlers.delete(this.webhookPath);
-        this.bot.telegram.deleteWebhook().catch(() => {});
-      } else {
-        this.bot.stop(reason);
-      }
-      this.started = false;
+    if (this.bridges.size === 0 && !this.controlStarted) {
+      this.stopTransport(reason);
       this.handlersRegistered = false;
       this._recreateBot();
     }
@@ -157,19 +228,26 @@ class SharedTelegramRuntime {
   async start() {
     if (this.started) return;
     if (this.startingPromise) return this.startingPromise;
+    clearTimeout(this.retryTimer);
+    this.retryTimer = null;
 
     this.startingPromise = (async () => {
       if (!this.handlersRegistered) this._recreateBot();
       this.registerHandlers();
+      const generation = ++this.generation;
+      this.transportStatus = 'connecting';
 
       if (this.isWebhookMode) {
         const fullUrl = `${this.webhookBaseUrl}${this.webhookPath}`;
         await this.bot.telegram.setWebhook(fullUrl);
         webhookHandlers.set(this.webhookPath, this.bot.webhookCallback(this.webhookPath));
         this.started = true;
+        this.transportStatus = 'running';
+        this.lastTransportError = null;
         this.bot.telegram.setMyCommands([
           { command: 'start', description: 'Mở menu quản lý bot' },
           { command: 'menu', description: 'Hiện menu chức năng' },
+          { command: 'ping', description: 'Kiểm tra bot còn nhận lệnh và phiên bản' },
           { command: 'ask', description: 'Hỏi AI: /ask câu hỏi' },
           { command: 'clear', description: 'Xóa lịch sử chat AI của bạn' },
           { command: 'zaloqr', description: 'Kết nối tài khoản Zalo bằng QR' },
@@ -183,6 +261,7 @@ class SharedTelegramRuntime {
           { command: 'denyai', description: 'Thu hồi quyền chat AI của Telegram ID' },
           { command: 'aiusers', description: 'Liệt kê ID được phép chat AI' },
           { command: 'telegram', description: 'Xem nhóm và topic của tài khoản' },
+          { command: 'telegramtest', description: 'Kiểm tra bot truy cập nhóm và quyền Topics' },
           { command: 'setforum', description: 'Đặt ID nhóm Telegram cho Zalo' },
           { command: 'bindtopic', description: 'Gán cuộc trò chuyện vào topic có sẵn' },
           { command: 'aitest', description: 'Kiểm tra kết nối 9Router và chế độ AI' },
@@ -193,19 +272,13 @@ class SharedTelegramRuntime {
         return;
       }
 
-      try {
-        await this.bot.telegram.callApi('getUpdates', { timeout: 0, offset: -1 });
-        this.logger.info('Kicked stale getUpdates session before launch.');
-      } catch (err) {
-        this.logger.warn({ code: err?.response?.error_code }, 'Pre-launch getUpdates kick (may 409, that is OK).');
-      }
-
       // Telegraf's polling launch promise can stay pending for the bot lifetime.
       // Mark the runtime started before launching and observe failures separately.
       this.started = true;
       this.bot.telegram.setMyCommands([
         { command: 'start', description: 'Mở menu quản lý bot' },
         { command: 'menu', description: 'Hiện menu chức năng' },
+        { command: 'ping', description: 'Kiểm tra bot còn nhận lệnh và phiên bản' },
         { command: 'ask', description: 'Hỏi AI: /ask câu hỏi' },
         { command: 'clear', description: 'Xóa lịch sử chat AI của bạn' },
         { command: 'zaloqr', description: 'Kết nối tài khoản Zalo bằng QR' },
@@ -219,18 +292,24 @@ class SharedTelegramRuntime {
         { command: 'denyai', description: 'Thu hồi quyền chat AI của Telegram ID' },
         { command: 'aiusers', description: 'Liệt kê ID được phép chat AI' },
         { command: 'telegram', description: 'Xem nhóm và topic của tài khoản' },
+        { command: 'telegramtest', description: 'Kiểm tra bot truy cập nhóm và quyền Topics' },
         { command: 'setforum', description: 'Đặt ID nhóm Telegram cho Zalo' },
         { command: 'bindtopic', description: 'Gán cuộc trò chuyện vào topic có sẵn' },
         { command: 'aitest', description: 'Kiểm tra kết nối 9Router và chế độ AI' },
         { command: 'topics', description: 'Liệt kê topic Zalo đã liên kết' },
         { command: 'id', description: 'Xem Telegram ID' },
       ]).catch((error) => this.logger.warn({ error }, 'Could not register Telegram command menu.'));
-      this.bot.launch().catch((err) => {
-        this.started = false;
-        this.logger.error({ err }, 'Telegram polling stopped with error.');
-      });
-      this.logger.info('Telegram bot started (long polling).');
-    })().finally(() => {
+      this.pollingTask = this.bot.launch({ dropPendingUpdates: false }, () => {
+        if (generation !== this.generation) throw new Error('Telegram launch cancelled');
+        this.transportStatus = 'running';
+        this.lastTransportError = null;
+        this.logger.info('Telegram bot connected (long polling).');
+      }).then(() => {
+        this.scheduleReconnect(new Error('Telegram polling ended unexpectedly.'), generation);
+      }).catch((error) => this.scheduleReconnect(error, generation));
+    })().catch((error) => {
+      this.scheduleReconnect(error);
+    }).finally(() => {
       this.startingPromise = null;
     });
 
@@ -249,6 +328,16 @@ class SharedTelegramRuntime {
   registerHandlers() {
     if (this.handlersRegistered) return;
     this.handlersRegistered = true;
+    this.bot.use(async (ctx, next) => {
+      this.lastUpdateAt = new Date().toISOString();
+      this.retryCount = 0;
+      this.transportStatus = 'running';
+      await next();
+    });
+    this.bot.command('ping', async (ctx) => {
+      const status = this.snapshot();
+      await ctx.reply(`🏓 Bot đang nhận lệnh.\nPhiên bản: ${status.version}\nTelegram: ${status.mode} / ${status.status}\nID của bạn: ${ctx.from?.id}`);
+    });
 
     const isAdmin = (ctx) => this.config.telegramAdminIds?.has(Number(ctx.from?.id)) || false;
     const isAiUser = async (ctx) => isAdmin(ctx) || Boolean(await this.manager?.isAiUserAllowed(ctx.from?.id));
@@ -328,7 +417,7 @@ class SharedTelegramRuntime {
         const lines = accounts.length
           ? (await Promise.all(accounts.map(async (account) => {
               const mode = await this.manager.getZaloAiMode(account.id);
-              return `• ${account.label} [${account.id}]: ${account.status}${account.listenerConnected ? ' (đang nghe tin)' : ''} · AI ${mode}${account.lastAiError ? '\n  Lỗi AI gần nhất: ' + account.lastAiError : ''}`;
+              return `• ${account.label} [${account.id}]: ${account.status}${account.listenerConnected ? ' (đang nghe tin)' : ''} · AI ${mode}${account.lastAiError ? '\n  Lỗi AI gần nhất: ' + account.lastAiError : ''}${account.lastTelegramError ? '\n  Lỗi nhóm Telegram: ' + account.lastTelegramError : ''}`;
             }))).join('\n')
           : 'Chưa có tài khoản Zalo.';
         await showMenu(ctx, `📊 Trạng thái tài khoản\n${lines}`);
@@ -383,6 +472,7 @@ class SharedTelegramRuntime {
         `⚙️ Telegram cho ${account.label} [${account.id}]\n• Bot: @${me.username}\n• ID nhóm: ${account.telegramForumChatId}\n• Topic: tự tạo riêng cho từng cuộc trò chuyện Zalo.\n\nCác tài khoản dùng chung bot quản lý; không phải nhập lại bot token. Thêm bot vào nhóm có Topics và cấp quyền quản lý topic.`,
         Markup.inlineKeyboard([
           [Markup.button.callback('✏️ Đổi ID nhóm', `zalo:setforum:${account.id}`)],
+          [Markup.button.callback('🔎 Kiểm tra nhóm', `zalo:tgtest:${account.id}`)],
           [Markup.button.callback('📌 Xem/gán topic', `zalo:topics:${account.id}`)],
         ]),
       );
@@ -404,6 +494,21 @@ class SharedTelegramRuntime {
       await this.manager.setTelegramForum(accountId, id);
       await ctx.reply(`✅ Đã đặt nhóm Telegram cho ${accountId}: ${id}. Các cuộc trò chuyện sẽ có topic riêng trong nhóm này; mapping nhóm cũ được giữ lại để có thể chuyển về.`);
     };
+    const testTelegramGroup = async (ctx, accountId) => requireAdmin(ctx, async () => {
+      const account = this.manager.getAccount(accountId);
+      if (!account) return ctx.reply('Dùng /telegramtest <account_id>, ví dụ /telegramtest zalo-1');
+      try {
+        await validateForum(account.telegramForumChatId);
+        const controller = this.manager.getController(accountId);
+        if (controller) {
+          controller.lastTelegramError = null;
+          if (controller.telegram) controller.telegram.forwardingBlockedUntil = 0;
+        }
+        await ctx.reply(`✅ Bot truy cập được nhóm ${account.telegramForumChatId} và có quyền quản lý Topics. Có thể gửi tin Zalo để tạo topic.`);
+      } catch (error) {
+        await ctx.reply(`❌ Không dùng được nhóm ${account.telegramForumChatId} cho ${accountId}.\n${humanError(error)}\nThêm đúng bot đang chat với bạn vào nhóm, cấp quyền Manage Topics, rồi thử lại. Dùng /id trong nhóm để xác nhận chat_id.`);
+      }
+    });
     const showAccountTopics = async (ctx, accountId) => requireAdmin(ctx, async () => {
       const mappings = await this.manager.listAccountConversations(accountId);
       if (!mappings.length) return ctx.reply('Chưa có cuộc trò chuyện. Gửi tin Zalo đến tài khoản này để bot tạo topic. Nếu không tạo được, kiểm tra quyền Manage Topics của bot.');
@@ -433,6 +538,7 @@ class SharedTelegramRuntime {
     });
 
     this.bot.command('telegram', (ctx) => showTelegramSettings(ctx, ctx.message.text.split(/\s+/)[1]));
+    this.bot.command('telegramtest', (ctx) => testTelegramGroup(ctx, ctx.message.text.split(/\s+/)[1]));
     this.bot.command('setforum', (ctx) => requireAdmin(ctx, async () => {
       const [, accountId, chatId] = ctx.message.text.split(/\s+/);
       if (!accountId || !chatId) return ctx.reply('Dùng /setforum <account_id> <-100...>');
@@ -443,7 +549,7 @@ class SharedTelegramRuntime {
       if (!accountId || !conversationId || !topicId) return ctx.reply('Dùng /bindtopic <account_id> <zalo_conversation_id> <topic_id>');
       try { await saveTopic(ctx, accountId, conversationId, topicId); } catch (error) { await ctx.reply(`Không gán được topic: ${humanError(error)}`); }
     }));
-    this.bot.command('aitest', (ctx) => testAi(ctx, ctx.message.text.split(/\s+/)[1]));
+    this.bot.command('aitest', (ctx) => requireAdmin(ctx, () => this.runAiJob(ctx, () => testAi(ctx, ctx.message.text.split(/\s+/)[1]))));
     this.bot.command('cancel', async (ctx) => {
       this.pendingSettings.delete(ctx.from?.id);
       await ctx.reply('Đã hủy thao tác nhập cấu hình.');
@@ -460,13 +566,11 @@ class SharedTelegramRuntime {
       const prompt = ctx.message.text.replace(/^\/ask(?:@[\w]+)?\s*/i, '').trim();
       if (!prompt) return showMenu(ctx, 'Dùng /ask kèm câu hỏi hoặc gửi thẳng câu hỏi trong chat riêng.');
       if (!this.manager) return ctx.reply('Bot quản lý chưa sẵn sàng.');
-      try {
+      return this.runAiJob(ctx, async () => {
         await ctx.sendChatAction('typing');
         const answer = await this.manager.chatWithAi(ctx.from.id, prompt);
         for (const part of splitTelegramText(answer)) await ctx.reply(part, isAdmin(ctx) ? MANAGEMENT_MENU : AI_USER_MENU);
-      } catch (error) {
-        await ctx.reply(`Không gọi được AI: ${humanError(error)}`, isAdmin(ctx) ? MANAGEMENT_MENU : AI_USER_MENU);
-      }
+      });
     });
     this.bot.command('clear', async (ctx) => {
       if (!(await isAiUser(ctx))) return deny(ctx);
@@ -530,7 +634,7 @@ class SharedTelegramRuntime {
         await this.manager.requestZaloQr(callbacks.onQr, ctx.match[1], callbacks.onStatus);
       } catch (error) { await ctx.reply(`Không tạo được QR: ${humanError(error)}`); }
     });
-    for (const action of ['telegram', 'topics', 'aitest', 'setforum']) {
+    for (const action of ['telegram', 'topics', 'aitest', 'setforum', 'tgtest']) {
       this.bot.action(new RegExp(`^zalo:${action}:(.+)$`), async (ctx) => {
         if (!isAdmin(ctx) || ctx.chat?.type !== 'private') return ctx.answerCbQuery('Chỉ admin được dùng trong chat riêng.');
         await ctx.answerCbQuery();
@@ -539,6 +643,7 @@ class SharedTelegramRuntime {
           if (action === 'telegram') return await showTelegramSettings(ctx, accountId);
           if (action === 'topics') return await showAccountTopics(ctx, accountId);
           if (action === 'aitest') return await testAi(ctx, accountId);
+          if (action === 'tgtest') return await testTelegramGroup(ctx, accountId);
           this.pendingSettings.set(ctx.from.id, { kind: 'forum', accountId, expires: Date.now() + 300000 });
           await ctx.reply(`Gửi ID nhóm Telegram cho ${accountId} (số âm bắt đầu -100). Dùng /id trong nhóm để lấy chat_id. Gửi /cancel để hủy.`);
         } catch (error) { await ctx.reply(`Không mở được cấu hình: ${humanError(error)}`); }
@@ -625,6 +730,7 @@ class SharedTelegramRuntime {
     this.bot.on(message('text'), async (ctx, next) => {
       if (ctx.chat?.type !== 'private') return next();
       const text = String(ctx.message.text || '').trim();
+      const menuText = normalizedMenuText(text);
       if (text.startsWith('/')) return next();
       if (!(await isAiUser(ctx))) return deny(ctx);
       const pending = this.pendingSettings.get(ctx.from.id);
@@ -640,15 +746,15 @@ class SharedTelegramRuntime {
         } catch (error) { await ctx.reply(`Không lưu được cấu hình: ${humanError(error)}\nGửi lại ID hoặc /cancel.`); }
         return;
       }
-      if (text === '🔗 Kết nối Zalo') return startQr(ctx);
-      if (text === '➕ Thêm tài khoản Zalo') return addZaloAccount(ctx);
-      if (text === '📋 Tài khoản Zalo') return showAccounts(ctx);
-      if (text === '📊 Trạng thái') return showStatus(ctx);
-      if (text === '🤖 Bật/tắt AI Zalo') {
+      if (menuText === 'Kết nối Zalo') return startQr(ctx);
+      if (menuText === 'Thêm tài khoản Zalo') return addZaloAccount(ctx);
+      if (menuText === 'Tài khoản Zalo') return showAccounts(ctx);
+      if (menuText === 'Trạng thái') return showStatus(ctx);
+      if (menuText === 'Bật/tắt AI Zalo') {
         return showAccounts(ctx);
       }
-      if (text === '🔐 Quyền chat AI') return showAiUsers(ctx);
-      if (text === '🧹 Xóa lịch sử AI') {
+      if (menuText === 'Quyền chat AI') return showAiUsers(ctx);
+      if (menuText === 'Xóa lịch sử AI') {
         try {
           await this.manager?.clearAiHistory(ctx.from.id);
           return showMenu(ctx, 'Đã xóa lịch sử chat AI của bạn.');
@@ -656,15 +762,13 @@ class SharedTelegramRuntime {
           return ctx.reply(`Không xóa được lịch sử: ${humanError(error)}`);
         }
       }
-      if (text === '💬 Chat với AI') return showMenu(ctx, 'Gửi câu hỏi tiếp theo trong chat này để trò chuyện với AI.');
-      try {
-        if (!this.manager) return showMenu(ctx, 'Bot quản lý chưa sẵn sàng.');
+      if (menuText === 'Chat với AI') return showMenu(ctx, 'Gửi câu hỏi tiếp theo trong chat này để trò chuyện với AI.');
+      if (!this.manager) return showMenu(ctx, 'Bot quản lý chưa sẵn sàng.');
+      return this.runAiJob(ctx, async () => {
         await ctx.sendChatAction('typing');
         const answer = await this.manager.chatWithAi(ctx.from.id, text);
         for (const part of splitTelegramText(answer)) await ctx.reply(part, isAdmin(ctx) ? MANAGEMENT_MENU : AI_USER_MENU);
-      } catch (error) {
-        await ctx.reply(`Không gọi được AI: ${humanError(error)}`, isAdmin(ctx) ? MANAGEMENT_MENU : AI_USER_MENU);
-      }
+      });
     });
 
     this.bot.command('id', async (ctx) => {
@@ -695,14 +799,17 @@ class SharedTelegramRuntime {
     });
 
     this.bot.on(message('text'), async (ctx) => {
-      if (ctx.message.text.startsWith('/')) return;
+      if (ctx.message.text.startsWith('/')) {
+        if (ctx.chat?.type === 'private') await ctx.reply('Lệnh chưa được hỗ trợ trong phiên bản đang chạy. Dùng /menu hoặc /ping.');
+        return;
+      }
       await this.routeTelegramMessage(ctx, 'text');
     });
 
     this.bot.on(message('photo'), async (ctx) => {
       if (ctx.chat?.type === 'private') {
         if (!(await isAiUser(ctx))) return deny(ctx);
-        try {
+        return this.runAiJob(ctx, async () => {
           await ctx.sendChatAction('typing');
           const imageUrl = await telegramPhotoDataUrl(ctx);
           const answer = await this.manager.chatWithAi(
@@ -711,10 +818,7 @@ class SharedTelegramRuntime {
             [imageUrl],
           );
           for (const part of splitTelegramText(answer)) await ctx.reply(part, isAdmin(ctx) ? MANAGEMENT_MENU : AI_USER_MENU);
-        } catch (error) {
-          await ctx.reply(`Không phân tích được ảnh: ${humanError(error)}`, isAdmin(ctx) ? MANAGEMENT_MENU : AI_USER_MENU);
-        }
-        return;
+        });
       }
       await this.routeTelegramMessage(ctx, 'photo');
     });
@@ -723,8 +827,11 @@ class SharedTelegramRuntime {
       await this.routeTelegramMessage(ctx, 'document');
     });
 
-    this.bot.catch((error, ctx) => {
+    this.bot.catch(async (error, ctx) => {
       this.logger.error({ error, updateType: ctx.updateType }, 'Telegram handler failed');
+      if (ctx.chat?.type === 'private') {
+        await ctx.reply(`Không xử lý được lệnh: ${humanError(error)}\nDùng /ping để kiểm tra kết nối bot.`).catch(() => {});
+      }
     });
   }
 
@@ -814,6 +921,19 @@ export async function startTelegramControlBot({ config, manager, logger }) {
     };
     manager.on('aiError', runtime.onAiError);
   }
+  if (!runtime.onTelegramError) {
+    const recent = new Map();
+    runtime.onTelegramError = (event) => {
+      const key = `${event.accountId}:${event.chatId}`;
+      if (Date.now() - (recent.get(key) || 0) < 60000) return;
+      recent.set(key, Date.now());
+      for (const id of runtime.config.telegramAdminIds || []) {
+        runtime.bot.telegram.sendMessage(id, `⚠️ Không chuyển được tin Zalo sang Telegram [${event.accountId}]\nNhóm: ${event.chatId}\n${humanError(event.error)}\nNếu vừa đổi bot, hãy thêm bot mới vào nhóm và cấp Manage Topics. Kiểm tra bằng /telegramtest ${event.accountId}.`)
+          .catch((error) => logger.warn({ error }, 'Could not report Telegram bridge error.'));
+      }
+    };
+    manager.on('telegramError', runtime.onTelegramError);
+  }
   await runtime.start();
   return runtime;
 }
@@ -825,26 +945,26 @@ export function stopTelegramControlBot(runtime, reason = 'shutdown') {
     runtime.manager?.off('aiError', runtime.onAiError);
     runtime.onAiError = null;
   }
-  if (runtime.bridges.size > 0) return;
-  if (runtime.isWebhookMode) {
-    webhookHandlers.delete(runtime.webhookPath);
-    runtime.bot.telegram.deleteWebhook().catch(() => {});
-  } else if (runtime.started) {
-    runtime.bot.stop(reason);
+  if (runtime.onTelegramError) {
+    runtime.manager?.off('telegramError', runtime.onTelegramError);
+    runtime.onTelegramError = null;
   }
-  runtime.started = false;
+  if (runtime.bridges.size > 0) return;
+  runtime.stopTransport(reason);
   runtime.handlersRegistered = false;
   runtime._recreateBot();
 }
 
 export class TelegramBridgeBot {
-  constructor({ config, store, zalo, logger, pendingEcho, onTranscript }) {
+  constructor({ config, store, zalo, logger, pendingEcho, onTranscript, onBridgeError }) {
     this.config = config;
     this.store = store;
     this.zalo = zalo;
     this.logger = logger;
     this.pendingEcho = pendingEcho || null;
     this.onTranscript = onTranscript;
+    this.onBridgeError = onBridgeError;
+    this.forwardingBlockedUntil = 0;
     this.forwardingZaloMessages = new Set();
     this.runtime = getRuntime(config, logger);
     this.bot = this.runtime.bot;
@@ -904,6 +1024,7 @@ export class TelegramBridgeBot {
   }
 
   async forwardZaloMessage(zaloMessage) {
+    if (Date.now() < this.forwardingBlockedUntil) return;
     const messageId = String(zaloMessage.id || '');
     const key = messageId ? `${zaloMessage.conversationId}:${messageId}` : '';
     if (key && this.forwardingZaloMessages.has(key)) return;
@@ -943,6 +1064,10 @@ export class TelegramBridgeBot {
       replyData: quoteDataForZalo(zaloMessage),
       threadType: zaloMessage.threadType,
     });
+    } catch (error) {
+      if (isTelegramDestinationError(error)) this.forwardingBlockedUntil = Date.now() + 60000;
+      this.onBridgeError?.({ chatId: this.config.telegramForumChatId, error: humanError(error) });
+      throw error;
     } finally {
       if (key) this.forwardingZaloMessages.delete(key);
     }

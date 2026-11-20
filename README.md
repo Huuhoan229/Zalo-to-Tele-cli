@@ -317,10 +317,12 @@ If `WEB_ACCESS_TOKEN` is set, open URLs with `?token=YOUR_TOKEN` or send it as a
 - `/id` shows `chat_id`, `message_thread_id`, and sender ID.
 - `/topics` lists mapped Telegram topics and Zalo conversations.
 - `/menu` opens the private management menu.
+- `/ping` confirms that Telegram commands are being received and shows the deployed commit when the host provides it.
 - `/allowai <telegram_user_id>`, `/denyai <telegram_user_id>`, `/aiusers` manage AI-only Telegram access.
 - `/zaloqr [account_id]`, `/addzalo [label]`, `/zaloaccounts`, `/zalostart <account_id>`, and `/zalostop <account_id>` manage Zalo accounts.
 - `/zaloai off|command|dm|all [account_id]` controls AI auto-replies for one account.
 - `/telegram <account_id>` shows the bot and destination group for that account.
+- `/telegramtest <account_id>` checks forum access and Manage Topics permission without creating a topic.
 - `/setforum <account_id> <-100...>` sets a forum group after checking the bot's Manage Topics permission.
 - `/bindtopic <account_id> <zalo_conversation_id> <topic_id>` binds a known conversation to an existing topic.
 - `/aitest <account_id>` tests the configured 9Router endpoint, key, and model and reports that account's AI mode.
@@ -356,6 +358,14 @@ To test from the connected Zalo account itself, explicitly send `/ask Xin chào`
 Open `/menu` → `Tài khoản Zalo` → select an account → `Nhóm/topic Telegram`. The account uses the same bot token as the management bot by default, so adding a Zalo account does not require entering another token. The settings show the bot username and group ID, with buttons to change the group or list and rebind conversation topics. Use `/id` in the target group/topic to obtain `chat_id` and `message_thread_id`. Numeric input prompts can be cancelled with `/cancel`.
 
 Each Zalo conversation has its own topic to keep Telegram-to-Zalo replies unambiguous. The bot normally creates this topic automatically. To choose an existing topic, open `Xem/gán topic` and select the conversation. A topic already mapped to another conversation/account is rejected. Changing the destination group reconnects the bridge with its saved session and archives that group's mappings/history so switching back can restore them; it preserves Zalo credentials, AI mode, and OCR configuration. Group choices made in Telegram persist across redeploys.
+
+### Troubleshoot missing Telegram messages
+
+If `createForumTopic` returns `400: chat not found`, the bot cannot access the configured group. Verify the group ID by sending `/id` inside that group. Add the exact bot shown by `/telegram <account_id>` to the group (especially if you changed to a new bot), enable Topics, and grant the bot administrator permission to Manage Topics. Use `/setforum <account_id> <chat_id>` if the ID differs, then `/telegramtest <account_id>`. Do not recreate MongoDB or rescan Zalo just to fix a Telegram group error.
+
+Group access errors are reported to Telegram admins and pause automatic forwarding retries for 60 seconds to avoid repeatedly calling a broken destination. A successful `/telegramtest` clears this pause immediately. AI replies to Zalo remain independent of the Telegram bridge.
+
+If private management commands are silent, try `/ping` and inspect the protected web `/status` response's `telegram` field. It reports transport status, last error, last update time, and deployed commit when available. Polling restarts with backoff after transient failures and no longer drops pending updates during startup. An invalid token is reported separately. Telegram API calls have bounded timeouts, and AI requests run in the background so `/menu`, `/ping`, and other management commands can respond while AI is busy. Keep the token active in only one running service/replica, as before.
 
 ### Keep Koyeb and Render as separate deployments
 

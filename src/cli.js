@@ -21,6 +21,7 @@ async function main() {
     consoleOutput: process.env.NODE_ENV !== 'production',
   });
   await manager.load();
+  let telegramControl = null;
 
   const webServer = startWebServer({
     port: config.webPort,
@@ -42,6 +43,8 @@ async function main() {
           status: snapshot.status || account.status,
           startedAt: snapshot.startedAt || account.startedAt || null,
           lastError: snapshot.lastError || account.lastError || null,
+          lastTelegramError: snapshot.lastTelegramError || null,
+          lastAiError: snapshot.lastAiError || null,
           qrImageBase64: snapshot.qrImageBase64 || null,
           listenerConnected: Boolean(snapshot.listenerConnected),
           accountName:
@@ -56,6 +59,7 @@ async function main() {
         accounts,
         selectedAccountId: state.selectedAccountId,
         webAccessProtected: Boolean(config.webAccessToken),
+        telegram: telegramControl?.snapshot() || { status: 'connecting' },
       };
     },
     onAddAccount: async (input) => {
@@ -70,7 +74,7 @@ async function main() {
     onRemoveAccount: (id) => manager.removeAccount(id),
   });
 
-  const telegramControl = await startTelegramControlBot({ config, manager, logger });
+  telegramControl = await startTelegramControlBot({ config, manager, logger });
 
   async function shutdown(reason) {
     await manager.stopAll(reason);

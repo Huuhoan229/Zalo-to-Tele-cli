@@ -41,6 +41,7 @@ export class BridgeController extends EventEmitter {
     this.status = 'idle';
     this.lastError = null;
     this.lastAiError = null;
+    this.lastTelegramError = null;
     this.lastAiReplyAt = null;
     this.startedAt = null;
     this.pendingEchoes = new Map();
@@ -149,6 +150,11 @@ export class BridgeController extends EventEmitter {
           consume: (conversationId) => this.consumePendingEcho(conversationId),
         },
         onTranscript: async (mapping, entry) => this.recordTranscript(mapping, entry),
+        onBridgeError: (event) => {
+          this.lastTelegramError = event.error;
+          this.emit('telegramError', { ...event, accountId: this.account.id });
+          this.emitChange();
+        },
       });
 
       this.zalo.on('connected', () => {
@@ -617,6 +623,7 @@ export class BridgeController extends EventEmitter {
       listenerConnected: this.listenerConnected,
       zaloAiMode: this.getZaloAiMode(),
       lastAiError: this.lastAiError,
+      lastTelegramError: this.lastTelegramError,
       lastAiReplyAt: this.lastAiReplyAt,
       conversations: this.getConversationList(),
     };
