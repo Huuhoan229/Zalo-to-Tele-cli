@@ -58,6 +58,20 @@ test('dm mode replies to incoming DMs but only explicit requests in groups', asy
   assert.equal(sent.length, 2);
 });
 
+test('command mode ignores regular messages and mentions but answers explicit commands', async (t) => {
+  setupAi(t);
+  const { controller, sent } = fixture();
+  controller.store.state.ai.zaloMode = 'command';
+  const group = { ...dm, isGroup: true, conversationId: 'group', threadType: 1 };
+  await controller.maybeReplyWithAi(dm);
+  await controller.maybeReplyWithAi({ ...group, raw: { data: { mentions: [{ uid: 'own' }] } } });
+  await controller.maybeReplyWithAi({ ...dm, text: '/ai' });
+  assert.equal(globalThis.fetch.mock.calls.length, 0);
+  await controller.maybeReplyWithAi({ ...dm, isSelf: true, text: '/ai hello' });
+  await controller.maybeReplyWithAi({ ...group, text: '/ask hello' });
+  assert.deepEqual(sent.map(({ conversationId }) => conversationId), ['friend', 'group']);
+});
+
 test('AI API failure is surfaced to management with the key redacted', async (t) => {
   setupAi(t, () => new Response('bad key private-test-key', { status: 401 }));
   const { controller, sent } = fixture();

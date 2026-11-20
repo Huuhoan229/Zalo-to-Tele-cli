@@ -4,6 +4,7 @@ import { message } from 'telegraf/filters';
 import fs from 'node:fs/promises';
 import { ensureDir, uniqueDownloadPath } from './media.js';
 import { boundTelegramApi, BoundedTelegramContext, normalizedMenuText } from './telegramTransport.js';
+import { TelegramGroupQueue, telegramRateLimitSeconds } from './telegramGroupQueue.js';
 
 const runtimes = new Map();
 
@@ -127,6 +128,7 @@ class SharedTelegramRuntime {
     this.lastUpdateAt = null;
     this.transportStatus = 'stopped';
     this.aiJobs = new Map();
+    this.groupQueue = new TelegramGroupQueue();
     this.webhookTimer = null;
     this.webhookCheck = null;
     this.webhookState = null;
@@ -316,6 +318,7 @@ class SharedTelegramRuntime {
           { command: 'zalostop', description: 'Dừng tài khoản Zalo' },
           { command: 'zalostatus', description: 'Xem trạng thái Zalo và AI' },
           { command: 'zaloai', description: 'Chế độ AI Zalo: off/command/dm/all' },
+          { command: 'zalomode', description: 'Đặt chế độ trả lời AI Zalo' },
           { command: 'allowai', description: 'Cấp quyền chat AI cho Telegram ID' },
           { command: 'denyai', description: 'Thu hồi quyền chat AI của Telegram ID' },
           { command: 'aiusers', description: 'Liệt kê ID được phép chat AI' },
@@ -351,6 +354,7 @@ class SharedTelegramRuntime {
         { command: 'zalostop', description: 'Dừng tài khoản Zalo' },
         { command: 'zalostatus', description: 'Xem trạng thái Zalo và AI' },
         { command: 'zaloai', description: 'Chế độ AI Zalo: off/command/dm/all' },
+        { command: 'zalomode', description: 'Đặt chế độ trả lời AI Zalo' },
         { command: 'allowai', description: 'Cấp quyền chat AI cho Telegram ID' },
         { command: 'denyai', description: 'Thu hồi quyền chat AI của Telegram ID' },
         { command: 'aiusers', description: 'Liệt kê ID được phép chat AI' },
@@ -596,7 +600,7 @@ class SharedTelegramRuntime {
       await ctx.reply(`Đang kiểm tra API 9Router cho ${accountId}…`);
       try {
         const result = await this.manager.testAi(accountId);
-        await ctx.reply(`✅ API AI trả lời: ${result.answer.slice(0, 500)}\n• Tài khoản: ${accountId}\n• Zalo: ${result.connected ? 'đang nghe tin' : 'chưa sẵn sàng'}\n• Chế độ: ${result.mode}\n${result.mode === 'off' ? 'AI đang tắt. Dùng /zaloai dm ' + accountId + ' nếu muốn bật.' : 'Dùng Zalo khác nhắn đến, hoặc gõ /ask Xin chào từ chính tài khoản này để thử.'}`);
+        await ctx.reply(`✅ API AI trả lời: ${result.answer.slice(0, 500)}\n• Tài khoản: ${accountId}\n• Zalo: ${result.connected ? 'đang nghe tin' : 'chưa sẵn sàng'}\n• Chế độ: ${result.mode}\n${result.mode === 'off' ? 'AI đang tắt. Dùng /zalomode command ' + accountId + ' để bật chỉ khi có lệnh.' : 'Gõ /ai Xin chào trong một cuộc trò chuyện Zalo để thử.'}`);
       } catch (error) { await ctx.reply(`❌ Kiểm tra AI thất bại: ${humanError(error)}`); }
     });
 
@@ -682,7 +686,7 @@ class SharedTelegramRuntime {
       const rows = [
         [Markup.button.callback('🔄 Quét lại QR', `zalo:qr:${id}`)],
         [Markup.button.callback('▶️ Bật', `zalo:start:${id}`), Markup.button.callback('⏸ Tắt', `zalo:stop:${id}`)],
-        [Markup.button.callback('🤖 Bật/tắt AI', `zalo:ai:${id}`)],
+        [Markup.button.callback('🤖 Chế độ AI', `zalo:modes:${id}`)],
         [Markup.button.callback('⚙️ Nhóm/topic Telegram', `zalo:telegram:${id}`)],
         [Markup.button.callback('🧪 Kiểm tra AI', `zalo:aitest:${id}`)],
       ];
@@ -743,19 +747,41 @@ class SharedTelegramRuntime {
       try {
         const id = ctx.match[1];
         const current = await this.manager.getZaloAiMode(id);
-        const next = current === 'off' ? 'dm' : 'off';
+        const next = current === 'off' ? 'command' : 'off';
         await this.manager.setZaloAiMode(next, id);
         await ctx.reply(`AI Zalo cho ${id}: ${next}`);
       } catch (error) { await ctx.reply(`Không đổi được chế độ AI: ${humanError(error)}`); }
     });
-    this.bot.command('zaloai', async (ctx) => {
+    this.bot.action(/^zalo:modes:(.+)$/, async (ctx) => {
+      if (!isAdmin(ctx) || ctx.chat?.type !== 'private') return ctx.answerCbQuery('Chỉ admin được dùng trong chat riêng với bot.');
+      await ctx.answerCbQuery();
+      const id = ctx.match[1];
+      const account = this.manager?.getAccount(id);
+      if (!account) return ctx.reply('Không tìm thấy tài khoản này.');
+      const current = await this.manager.getZaloAiMode(id);
+      const button = (mode, label) => Markup.button.callback(
+        current === mode ? `✓ ${label}` : label, `zalo:mode:${mode}:${id}`,
+      );
+      return ctx.reply(`AI Zalo cho ${account.label} (${id}) đang ở chế độ ${current}.`, Markup.inlineKeyboard([
+        [button('command', 'Chỉ khi dùng /ai hoặc /ask')],
+        [button('dm', 'Tự trả lời tin riêng'), button('all', 'Tự trả lời cả nhóm')],
+        [button('off', 'Tắt AI')],
+      ]));
+    });
+    this.bot.action(/^zalo:mode:(off|command|dm|all):(.+)$/, async (ctx) => {
+      if (!isAdmin(ctx) || ctx.chat?.type !== 'private') return ctx.answerCbQuery('Chỉ admin được dùng trong chat riêng với bot.');
+      await ctx.answerCbQuery();
+      await setAiMode(ctx, ctx.match[1], ctx.match[2]);
+    });
+    this.bot.command(['zaloai', 'zalomode'], async (ctx) => {
       if (!isAdmin(ctx)) return deny(ctx);
       if (ctx.chat?.type !== 'private') return ctx.reply('Dùng lệnh này trong chat riêng với bot.');
-      const [, modeArg, accountId] = ctx.message.text.split(/\s+/);
+      const [command, modeArg, accountId] = ctx.message.text.trim().split(/\s+/);
       const mode = modeArg?.toLowerCase();
-      if (!mode) return showStatus(ctx);
+      if (!mode && /^\/zaloai(?:@|$)/i.test(command)) return showStatus(ctx);
+      if (!mode) return ctx.reply('Dùng /zalomode <chế độ> [account_id]\n• command: chỉ trả lời /ai hoặc /ask có câu hỏi\n• dm: tự trả lời tin riêng; trong nhóm dùng lệnh hoặc tag\n• all: tự trả lời cả tin riêng lẫn nhóm\n• off: tắt AI Zalo\n\nVí dụ: /zalomode command zalo-1');
       if (!['off', 'command', 'dm', 'all'].includes(mode)) {
-        return ctx.reply('Dùng /zaloai off|command|dm|all [account_id]');
+        return ctx.reply('Dùng /zalomode off|command|dm|all [account_id]');
       }
       await setAiMode(ctx, mode, accountId || null);
     });
@@ -991,7 +1017,12 @@ export async function startTelegramControlBot({ config, manager, logger }) {
       if (Date.now() - (recent.get(key) || 0) < 60000) return;
       recent.set(key, Date.now());
       for (const id of runtime.config.telegramAdminIds || []) {
-        runtime.bot.telegram.sendMessage(id, `⚠️ Không chuyển được tin Zalo sang Telegram [${event.accountId}]\nNhóm: ${event.chatId}\n${humanError(event.error)}\nNếu vừa đổi bot, hãy thêm bot mới vào nhóm và cấp Manage Topics. Kiểm tra bằng /telegramtest ${event.accountId}.`)
+        const hint = event.rateLimited
+          ? 'Telegram đang giới hạn tốc độ; tin này chưa gửi được sau các lần thử. Bot sẽ giãn các lượt gửi tiếp theo.'
+          : event.destinationError
+            ? `Kiểm tra nhóm và quyền Manage Topics bằng /telegramtest ${event.accountId}.`
+            : 'Xem log Koyeb để biết chi tiết.';
+        runtime.bot.telegram.sendMessage(id, `⚠️ Không chuyển được tin Zalo sang Telegram [${event.accountId}]\nNhóm: ${event.chatId}\n${humanError(event.error)}\n${hint}`)
           .catch((error) => logger.warn({ error }, 'Could not report Telegram bridge error.'));
       }
     };
@@ -1029,17 +1060,21 @@ export class TelegramBridgeBot {
     this.onBridgeError = onBridgeError;
     this.forwardingBlockedUntil = 0;
     this.forwardingZaloMessages = new Set();
+    this.pendingTopics = new Map();
+    this.forwardingAbort = new AbortController();
     this.runtime = getRuntime(config, logger);
     this.bot = this.runtime.bot;
   }
 
   async start() {
+    if (this.forwardingAbort.signal.aborted) this.forwardingAbort = new AbortController();
     await ensureDir(this.config.downloadDir);
     this.runtime.addBridge(this);
     await this.runtime.start();
   }
 
   stop(reason) {
+    this.forwardingAbort.abort();
     this.runtime.removeBridge(this, reason);
   }
 
@@ -1053,18 +1088,17 @@ export class TelegramBridgeBot {
   }
 
   async createTopicMapping(zaloMessage, previous = null) {
-    const topic = await this.bot.telegram.createForumTopic(
-      this.config.telegramForumChatId,
-      topicName(zaloMessage.title, this.config.accountLabel),
-    );
-
-    return this.store.upsertMapping({
-      ...previous,
-      conversationId: zaloMessage.conversationId,
-      threadType: zaloMessage.threadType,
-      topicId: topic.message_thread_id,
-      title: zaloMessage.title,
-    });
+    const key = String(zaloMessage.conversationId);
+    if (this.pendingTopics.has(key)) return this.pendingTopics.get(key);
+    const chatId = this.config.telegramForumChatId;
+    const task = this.runtime.groupQueue.run(chatId, () => this.bot.telegram.createForumTopic(
+      chatId, topicName(zaloMessage.title, this.config.accountLabel),
+    ), this.forwardingAbort.signal).then((topic) => this.store.upsertMapping({
+      ...previous, conversationId: zaloMessage.conversationId, threadType: zaloMessage.threadType,
+      topicId: topic.message_thread_id, title: zaloMessage.title,
+    })).finally(() => this.pendingTopics.delete(key));
+    this.pendingTopics.set(key, task);
+    return task;
   }
 
   async refreshTopicTitle(existing, zaloMessage) {
@@ -1072,10 +1106,12 @@ export class TelegramBridgeBot {
     if (!nextTitle || nextTitle === existing.title) return existing;
 
     try {
-      await this.bot.telegram.editForumTopic(this.config.telegramForumChatId, existing.topicId, {
+      const chatId = this.config.telegramForumChatId;
+      await this.runtime.groupQueue.run(chatId, () => this.bot.telegram.editForumTopic(chatId, existing.topicId, {
         name: topicName(nextTitle, this.config.accountLabel),
-      });
+      }), this.forwardingAbort.signal);
     } catch (error) {
+      if (this.forwardingAbort.signal.aborted) throw error;
       this.logger.warn({ error, topicId: existing.topicId }, 'Could not rename Telegram topic.');
       return existing;
     }
@@ -1128,8 +1164,15 @@ export class TelegramBridgeBot {
       threadType: zaloMessage.threadType,
     });
     } catch (error) {
-      if (isTelegramDestinationError(error)) this.forwardingBlockedUntil = Date.now() + 60000;
-      this.onBridgeError?.({ chatId: this.config.telegramForumChatId, error: humanError(error) });
+      if (this.forwardingAbort.signal.aborted) return;
+      const destinationError = isTelegramDestinationError(error);
+      if (destinationError) this.forwardingBlockedUntil = Date.now() + 60000;
+      this.onBridgeError?.({
+        chatId: this.config.telegramForumChatId,
+        error: humanError(error),
+        rateLimited: telegramRateLimitSeconds(error) !== null,
+        destinationError,
+      });
       throw error;
     } finally {
       if (key) this.forwardingZaloMessages.delete(key);
@@ -1137,35 +1180,38 @@ export class TelegramBridgeBot {
   }
 
   async sendZaloMessageToTelegram(mapping, zaloMessage) {
+    const chatId = this.config.telegramForumChatId;
+    const send = (action) => this.runtime.groupQueue.run(chatId, action, this.forwardingAbort.signal);
     const options = { message_thread_id: mapping.topicId };
 
     if (zaloMessage.attachment?.url) {
       try {
-        return await this.bot.telegram.sendPhoto(
-          this.config.telegramForumChatId,
+        return await send(() => this.bot.telegram.sendPhoto(
+          chatId,
           Input.fromURL(zaloMessage.attachment.url),
           {
             ...options,
             caption: formatZaloMessage(zaloMessage).slice(0, 1024),
           },
-        );
+        ));
       } catch (error) {
-        if (isTelegramThreadNotFound(error)) throw error;
+        if (this.forwardingAbort.signal.aborted || isTelegramThreadNotFound(error) ||
+            telegramRateLimitSeconds(error) !== null || isTelegramDestinationError(error)) throw error;
         this.logger.warn({ error }, 'Telegram could not fetch Zalo attachment URL; falling back to text.');
-        return await this.bot.telegram.sendMessage(
-          this.config.telegramForumChatId,
+        return await send(() => this.bot.telegram.sendMessage(
+          chatId,
           `${formatZaloMessage(zaloMessage)}\n${zaloMessage.attachment.url}`,
           options,
-        );
+        ));
       }
       return;
     }
 
-    return this.bot.telegram.sendMessage(
-      this.config.telegramForumChatId,
+    return send(() => this.bot.telegram.sendMessage(
+      chatId,
       formatZaloMessage(zaloMessage),
       options,
-    );
+    ));
   }
 
   async forwardTelegramText(ctx, mapped = null) {

@@ -544,8 +544,6 @@ export class BridgeController extends EventEmitter {
       shouldReply = true;
     } else if (mode === 'dm' && (!message.isGroup || mentionsSelf)) {
       shouldReply = true;
-    } else if ((mode === 'command' || mode === 'dm') && message.isGroup && mentionsSelf) {
-      shouldReply = true;
     }
     if (!shouldReply) return;
     if (message.isGroup && message.senderName) prompt = `[${message.senderName}] ${prompt}`;
@@ -560,8 +558,9 @@ export class BridgeController extends EventEmitter {
         text: prompt,
         imageUrls: message.attachment?.url ? [message.attachment.url] : [],
       });
-      if (this.manualStop || this.getZaloAiMode() === 'off') return;
       for (let offset = 0; offset < answer.length; offset += 3000) {
+        const currentMode = this.getZaloAiMode();
+        if (this.manualStop || currentMode === 'off' || (currentMode === 'command' && !commandMatch)) return;
         this.registerPendingEcho(message.conversationId, answer.slice(offset, offset + 3000));
         try {
           await this.zalo.sendText({

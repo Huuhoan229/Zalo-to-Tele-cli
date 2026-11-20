@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { Context } from 'telegraf';
 import { TelegramBridgeBot } from '../src/telegramBot.js';
+import { TelegramGroupQueue } from '../src/telegramGroupQueue.js';
 import { boundTelegramApi, normalizedMenuText } from '../src/telegramTransport.js';
 
 function fixture(token = '444:transport-test') {
@@ -135,6 +136,48 @@ test('chat not found reports the destination once and backs off topic creation',
   assert.equal(calls, 1);
   assert.equal(errors[0].chatId, -1004340385141);
   assert.match(errors[0].error, /chat not found/);
+});
+
+test('a Telegram 429 delays topic creation, and concurrent Zalo messages reuse the created topic', async () => {
+  const { bridge, runtime } = fixture('449:group-queue-test');
+  let clock = 100000;
+  let mapping;
+  const events = [];
+  runtime.groupQueue = new TelegramGroupQueue({
+    now: () => clock,
+    wait: async (ms) => { clock += ms; },
+  });
+  bridge.store = {
+    listMessages: () => [],
+    getByConversation: () => mapping,
+    upsertMapping: async (next) => { mapping = next; return next; },
+  };
+  const attempts = [];
+  bridge.bot.telegram.createForumTopic = async (chatId) => {
+    attempts.push(clock);
+    assert.equal(chatId, -1001);
+    if (attempts.length === 1) {
+      throw { response: { error_code: 429, parameters: { retry_after: 3 } } };
+    }
+    return { message_thread_id: 27 };
+  };
+  bridge.bot.telegram.sendMessage = async (chatId, text, { message_thread_id: topicId }) => {
+    events.push({ chatId, topicId, text, at: clock });
+  };
+  try {
+    const message = { conversationId: 'friend', title: 'Friend', text: 'First' };
+    await Promise.all([
+      bridge.forwardZaloMessage({ ...message, id: 'm1' }),
+      bridge.forwardZaloMessage({ ...message, id: 'm2', text: 'Second' }),
+    ]);
+    assert.deepEqual(attempts, [100000, 103250]);
+    assert.deepEqual(events.map(({ chatId, topicId }) => [chatId, topicId]), [[-1001, 27], [-1001, 27]]);
+    assert.match(events[0].text, /First/);
+    assert.match(events[1].text, /Second/);
+    assert.ok(events[1].at - events[0].at >= 1000);
+  } finally {
+    runtime.removeBridge(bridge);
+  }
 });
 
 test('menu labels ignore emoji and variation selectors', () => {

@@ -14,6 +14,7 @@ test('Telegram menu routes QR, permissions, and forum replies through one runtim
   const qrRequests = [];
   const loginStatuses = [];
   const zaloSent = [];
+  const modes = [];
   const mapping = { conversationId: 'zalo-chat', threadType: 1, topicId: 17 };
   const bridge = new TelegramBridgeBot({
     config: {
@@ -26,6 +27,9 @@ test('Telegram menu routes QR, permissions, and forum replies through one runtim
   });
   const runtime = bridge.runtime;
   runtime.manager = {
+    getAccount: (id) => ({ id, label: 'Test Zalo' }),
+    getZaloAiMode: async () => 'dm',
+    setZaloAiMode: async (mode, id) => { modes.push([mode, id]); return mode; },
     isAiUserAllowed: async (id) => id === 222,
     requestZaloQr: async (_onQr, id, onStatus) => { qrRequests.push(id); loginStatuses.push(onStatus); },
     chatWithAi: async (_id, prompt) => `AI: ${prompt}`,
@@ -36,7 +40,7 @@ test('Telegram menu routes QR, permissions, and forum replies through one runtim
     sendChatAction: async () => {},
   };
   let updateId = 1;
-  async function dispatch(text, userId = 111, forum = false) {
+  async function dispatch(text, userId = 111, forum = false, data = null) {
     const command = text.match(/^\/\w+/)?.[0];
     const update = {
       update_id: updateId++,
@@ -48,6 +52,10 @@ test('Telegram menu routes QR, permissions, and forum replies through one runtim
         ...(command ? { entities: [{ type: 'bot_command', offset: 0, length: command.length }] } : {}),
       },
     };
+    if (data) {
+      update.callback_query = { id: String(updateId), from: update.message.from, message: update.message, data };
+      delete update.message;
+    }
     const ctx = new Context(update, telegram, { id: 123, username: 'testbot', is_bot: true });
     await runtime.bot.middleware()(ctx, async () => {});
   }
@@ -55,6 +63,15 @@ test('Telegram menu routes QR, permissions, and forum replies through one runtim
   assert.match(sent.at(-1).text, /from_id: 333/);
   await dispatch('/menu');
   assert.ok(sent.at(-1).extra.reply_markup.keyboard.flat().some((item) => (item.text || item) === '🔗 Kết nối Zalo'));
+  telegram.answerCbQuery = async () => {};
+  await dispatch('/zalomode');
+  assert.match(sent.at(-1).text, /\/zalomode command zalo-1/);
+  await dispatch('', 111, false, 'zalo:modes:zalo-1');
+  assert.equal(sent.at(-1).extra.reply_markup.inline_keyboard.flat().length, 4);
+  await dispatch('', 111, false, 'zalo:mode:command:zalo-1');
+  await dispatch('/zalomode all zalo-1');
+  await dispatch('/zaloai off zalo1');
+  assert.deepEqual(modes, [['command', 'zalo-1'], ['all', 'zalo-1'], ['off', 'zalo1']]);
   await dispatch('🔗 Kết nối Zalo');
   await dispatch('/zaloqr zalo-2');
   assert.deepEqual(qrRequests, [null, 'zalo-2']);

@@ -320,7 +320,7 @@ If `WEB_ACCESS_TOKEN` is set, open URLs with `?token=YOUR_TOKEN` or send it as a
 - `/ping` confirms that Telegram commands are being received and shows the deployed commit when the host provides it.
 - `/allowai <telegram_user_id>`, `/denyai <telegram_user_id>`, `/aiusers` manage AI-only Telegram access.
 - `/zaloqr [account_id]`, `/addzalo [label]`, `/zaloaccounts`, `/zalostart <account_id>`, and `/zalostop <account_id>` manage Zalo accounts.
-- `/zaloai off|command|dm|all [account_id]` controls AI auto-replies for one account.
+- `/zalomode off|command|dm|all [account_id]` controls AI auto-replies for one account. `/zaloai` still works.
 - `/telegram <account_id>` shows the bot and destination group for that account.
 - `/telegramtest <account_id>` checks forum access and Manage Topics permission without creating a topic.
 - `/setforum <account_id> <-100...>` sets a forum group after checking the bot's Manage Topics permission.
@@ -333,7 +333,7 @@ Open a private chat with the bot and use `/start` or `/menu`. The menu provides:
 
 - `Chat với AI`: sends questions to an OpenAI-compatible endpoint, including a 9Router deployment.
 - `Kết nối Zalo`: starts QR login for the configured Zalo account.
-- `Bật/tắt AI Zalo`: opens the account list; each account has an AI toggle between `dm` and `off`.
+- `Bật/tắt AI Zalo`: opens the account list. Select an account, then open `Chế độ AI` to choose `off`, `command`, `dm`, or `all`.
 - `Trạng thái`: shows the Zalo listener and current AI mode.
 
 When you request QR login, add an account, or start an account from Telegram, the bot reports QR scan/phone confirmation, QR expiry or rejection, login failure, and successful connection in the requesting admin's private chat. Success is sent once the bridge is running and the Zalo listener is connected; it includes the account ID, current AI mode, and MongoDB session storage status. If readiness is still unconfirmed after five minutes, the bot asks you to check `/zalostatus` or request a new QR.
@@ -349,7 +349,7 @@ AI_MODEL=your_model_or_combo
 AI_SYSTEM_PROMPT=Bạn là trợ lý hữu ích. Trả lời bằng ngôn ngữ người dùng sử dụng.
 ```
 
-The bot supports `/ask <câu hỏi>` and `/zaloai off|command|dm|all [account_id]`. In `command` mode, Zalo replies require `/ask`, `/ai`, or an explicit group mention; `dm` also replies to private chats; `all` replies to all incoming text messages and images. AI defaults to `off` for each Zalo account. Image analysis requires a model with vision support. AI chat history and AI access permissions are stored in a dedicated MongoDB control record; each account's Zalo AI mode stays with that account's bridge record.
+Use `/zalomode command zalo-1` in Telegram, then send `/ai Xin chào` or `/ask Xin chào` in Zalo. The `command` mode requires one of these commands with a question; regular messages and group mentions alone do not trigger a reply. The `dm` mode auto-replies to private chats, and in groups it replies to commands or mentions. The `all` mode auto-replies to incoming text and images in private chats and groups. AI defaults to `off` for each account. Image analysis requires a model with vision support. AI chat history and access permissions are stored in a dedicated MongoDB control record; each account's AI mode stays with that account's bridge record.
 
 To test from the connected Zalo account itself, explicitly send `/ask Xin chào` or `/ai Xin chào` in a Zalo conversation while that account's AI mode is enabled. Ordinary self-authored messages and AI-generated replies are ignored to avoid loops. `off` disables even explicit self-authored AI commands. AI delivery to Zalo does not depend on Telegram topic creation succeeding. API/delivery errors appear in `/zalostatus` and are reported to Telegram admins, with repeated identical errors limited to one notification per account per minute.
 
@@ -364,6 +364,8 @@ Each Zalo conversation has its own topic to keep Telegram-to-Zalo replies unambi
 If `createForumTopic` returns `400: chat not found`, the bot cannot access the configured group. Verify the group ID by sending `/id` inside that group. Add the exact bot shown by `/telegram <account_id>` to the group (especially if you changed to a new bot), enable Topics, and grant the bot administrator permission to Manage Topics. Use `/setforum <account_id> <chat_id>` if the ID differs, then `/telegramtest <account_id>`. Do not recreate MongoDB or rescan Zalo just to fix a Telegram group error.
 
 Group access errors are reported to Telegram admins and pause automatic forwarding retries for 60 seconds to avoid repeatedly calling a broken destination. A successful `/telegramtest` clears this pause immediately. AI replies to Zalo remain independent of the Telegram bridge.
+
+Telegram's `429 Too Many Requests` is a rate limit. The bridge spaces out topic creation and message delivery across all topics in each Telegram group, and retries rejected requests using Telegram's `retry_after` value. Forwarded messages can arrive later during a burst.
 
 If private management commands are silent, try `/ping` and inspect the protected web `/status` response's `telegram` field. It reports transport status, last error, last update time, and deployed commit when available. Polling restarts with backoff after transient failures and no longer drops pending updates during startup. An invalid token is reported separately. Telegram API calls have bounded timeouts, and AI requests run in the background so `/menu`, `/ping`, and other management commands can respond while AI is busy. Keep the token active in only one running service/replica, as before.
 
