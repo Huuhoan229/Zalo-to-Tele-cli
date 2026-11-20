@@ -127,9 +127,16 @@ class SharedTelegramRuntime {
     this.lastUpdateAt = null;
     this.transportStatus = 'stopped';
     this.aiJobs = new Map();
+    this.webhookTimer = null;
+    this.webhookCheck = null;
+    this.webhookState = null;
+    this.lastWebhookRequestAt = null;
     // Webhook mode: đọc TELEGRAM_WEBHOOK_URL từ env (setting toàn deployment).
     // Nếu không set → fallback về long polling (chạy local).
-    const webhookBaseUrl = process.env.TELEGRAM_WEBHOOK_URL?.trim().replace(/\/$/, '') || '';
+    const webhookInput = process.env.TELEGRAM_WEBHOOK_URL?.trim() || '';
+    // Our HTTP server serves webhook paths at the origin root. A QR-page query
+    // or copied /status path must never become part of the Telegram endpoint.
+    const webhookBaseUrl = webhookInput ? new URL(webhookInput).origin : '';
     this.webhookBaseUrl = webhookBaseUrl;
     this.webhookPath = webhookBaseUrl ? webhookPathForToken(config.telegramBotToken) : null;
   }
@@ -153,6 +160,10 @@ class SharedTelegramRuntime {
       retryCount: this.retryCount,
       aiJobs: this.aiJobs.size,
       version: (process.env.KOYEB_GIT_SHA || process.env.RENDER_GIT_COMMIT || '').slice(0, 7) || 'local',
+      botUsername: this.bot.botInfo?.username || null,
+      botId: this.bot.botInfo?.id || null,
+      webhook: this.webhookState,
+      lastWebhookRequestAt: this.lastWebhookRequestAt,
     };
   }
 
@@ -160,14 +171,55 @@ class SharedTelegramRuntime {
     this.generation += 1;
     clearTimeout(this.retryTimer);
     this.retryTimer = null;
+    clearInterval(this.webhookTimer);
+    this.webhookTimer = null;
     if (this.isWebhookMode) {
       webhookHandlers.delete(this.webhookPath);
-      this.bot.telegram.deleteWebhook().catch(() => {});
+      // Do not delete a bot-global webhook here: a newer deployment may have
+      // registered the same bot before this old instance receives SIGTERM.
     } else {
       try { this.bot.stop(reason); } catch { /* launch may still be awaiting getMe */ }
     }
     this.started = false;
     this.transportStatus = 'stopped';
+  }
+
+  async refreshWebhook() {
+    if (!this.isWebhookMode || !this.started) return;
+    if (this.webhookCheck) return this.webhookCheck;
+    const generation = this.generation;
+    this.webhookCheck = (async () => {
+      const expectedUrl = `${this.webhookBaseUrl}${this.webhookPath}`;
+      try {
+        let info = await this.bot.telegram.getWebhookInfo();
+        if (generation !== this.generation || !this.started) return;
+        let repaired = false;
+        if (info.url !== expectedUrl) {
+          this.logger.warn('Telegram webhook was removed or changed; restoring this deployment endpoint.');
+          await this.bot.telegram.setWebhook(expectedUrl, { drop_pending_updates: false, allowed_updates: ['message', 'callback_query'] });
+          if (generation !== this.generation || !this.started) return;
+          info = await this.bot.telegram.getWebhookInfo();
+          repaired = true;
+        }
+        if (generation !== this.generation || !this.started) return;
+        const lastError = info.last_error_message ? humanError(info.last_error_message) : null;
+        this.webhookState = {
+          registered: Boolean(info.url),
+          matchesExpectedUrl: info.url === expectedUrl,
+          pendingUpdateCount: info.pending_update_count || 0,
+          lastDeliveryError: lastError,
+          lastDeliveryErrorAt: info.last_error_date ? new Date(info.last_error_date * 1000).toISOString() : null,
+          checkedAt: new Date().toISOString(),
+          ...(repaired ? { restoredAt: new Date().toISOString() } : {}),
+        };
+        if (lastError) this.logger.warn({ error: lastError, pendingUpdates: this.webhookState.pendingUpdateCount }, 'Telegram reports a webhook delivery error.');
+      } catch (error) {
+        if (generation !== this.generation || !this.started) return;
+        this.webhookState = { ...this.webhookState, checkError: humanError(error), checkedAt: new Date().toISOString() };
+        this.logger.warn({ error: humanError(error) }, 'Could not verify Telegram webhook registration.');
+      }
+    })().finally(() => { this.webhookCheck = null; });
+    return this.webhookCheck;
   }
 
   scheduleReconnect(error, generation = this.generation) {
@@ -239,8 +291,15 @@ class SharedTelegramRuntime {
 
       if (this.isWebhookMode) {
         const fullUrl = `${this.webhookBaseUrl}${this.webhookPath}`;
-        await this.bot.telegram.setWebhook(fullUrl);
-        webhookHandlers.set(this.webhookPath, this.bot.webhookCallback(this.webhookPath));
+        this.bot.botInfo = await this.bot.telegram.getMe();
+        if (generation !== this.generation) return;
+        const callback = this.bot.webhookCallback(this.webhookPath);
+        webhookHandlers.set(this.webhookPath, (req, res) => {
+          this.lastWebhookRequestAt = new Date().toISOString();
+          return callback(req, res);
+        });
+        await this.bot.telegram.setWebhook(fullUrl, { drop_pending_updates: false, allowed_updates: ['message', 'callback_query'] });
+        if (generation !== this.generation) return;
         this.started = true;
         this.transportStatus = 'running';
         this.lastTransportError = null;
@@ -268,7 +327,11 @@ class SharedTelegramRuntime {
           { command: 'topics', description: 'Liệt kê topic Zalo đã liên kết' },
           { command: 'id', description: 'Xem Telegram ID' },
         ]).catch((error) => this.logger.warn({ error }, 'Could not register Telegram command menu.'));
-        this.logger.info({ url: fullUrl }, 'Telegram webhook registered.');
+        this.logger.info({ bot: this.bot.botInfo.username, origin: this.webhookBaseUrl }, 'Telegram webhook registered.');
+        await this.refreshWebhook();
+        clearInterval(this.webhookTimer);
+        this.webhookTimer = setInterval(() => { void this.refreshWebhook(); }, 20000);
+        this.webhookTimer.unref?.();
         return;
       }
 
@@ -336,7 +399,7 @@ class SharedTelegramRuntime {
     });
     this.bot.command('ping', async (ctx) => {
       const status = this.snapshot();
-      await ctx.reply(`🏓 Bot đang nhận lệnh.\nPhiên bản: ${status.version}\nTelegram: ${status.mode} / ${status.status}\nID của bạn: ${ctx.from?.id}`);
+      await ctx.reply(`🏓 Bot đang nhận lệnh.\nBot: @${status.botUsername || ctx.botInfo?.username || '(chưa rõ)'}\nPhiên bản: ${status.version}\nTelegram: ${status.mode} / ${status.status}\nID của bạn: ${ctx.from?.id}`);
     });
 
     const isAdmin = (ctx) => this.config.telegramAdminIds?.has(Number(ctx.from?.id)) || false;

@@ -72,6 +72,17 @@ function renderPage(status, accessToken) {
     const statusPath = withToken('/status', accessToken);
     const running = status.accounts.filter((account) => account.status === 'running').length;
     const total = status.accounts.length;
+    const telegram = status.telegram || {};
+    const telegramSummary = [
+      `Bot: ${telegram.botUsername ? '@' + telegram.botUsername : 'đang xác định'} · phiên bản ${telegram.version || 'chưa rõ'}`,
+      `Nhận lệnh: ${telegram.mode || 'chưa rõ'} / ${telegram.status || 'đang khởi động'}`,
+      `Lệnh gần nhất tới server: ${telegram.lastUpdateAt || 'chưa nhận được lệnh nào'}`,
+      ...(telegram.webhook ? [
+        `Webhook: ${telegram.webhook.matchesExpectedUrl ? 'đúng địa chỉ' : 'chưa đúng hoặc chưa đăng ký'} · tin chờ: ${telegram.webhook.pendingUpdateCount || 0}`,
+        ...(telegram.webhook.lastDeliveryError ? [`Lỗi giao tin gần nhất: ${telegram.webhook.lastDeliveryError}`] : []),
+        ...(telegram.webhook.checkError ? [`Lỗi kiểm tra webhook: ${telegram.webhook.checkError}`] : []),
+      ] : []),
+    ].join('\n');
 
     return `<!doctype html>
 <html lang="en">
@@ -112,6 +123,10 @@ function renderPage(status, accessToken) {
   <main>
     <h1>Zalo-to-Tele</h1>
     <p id="summary">Status: <strong>${escapeHtml(status.status)}</strong> - ${running}/${total} account running</p>
+    <section class="panel" style="margin-top:16px">
+      <h2>Bot Telegram</h2>
+      <p id="telegram-state" style="white-space:pre-line">${escapeHtml(telegramSummary)}</p>
+    </section>
     <form id="add-account-form" class="toolbar">
       <input name="label" type="text" maxlength="80" placeholder="Tên tài khoản, ví dụ Zalo 2">
       <button type="submit">+ Thêm tài khoản Zalo</button>
@@ -153,6 +168,18 @@ function renderPage(status, accessToken) {
         const data = await response.json();
         const runningCount = data.accounts.filter((a) => a.status === 'running').length;
         document.querySelector('#summary').textContent = 'Status: ' + data.status + ' - ' + runningCount + '/' + data.accounts.length + ' account running';
+        const tg = data.telegram || {};
+        const lines = [
+          'Bot: ' + (tg.botUsername ? '@' + tg.botUsername : 'đang xác định') + ' · phiên bản ' + (tg.version || 'chưa rõ'),
+          'Nhận lệnh: ' + (tg.mode || 'chưa rõ') + ' / ' + (tg.status || 'đang khởi động'),
+          'Lệnh gần nhất tới server: ' + (tg.lastUpdateAt || 'chưa nhận được lệnh nào')
+        ];
+        if (tg.webhook) {
+          lines.push('Webhook: ' + (tg.webhook.matchesExpectedUrl ? 'đúng địa chỉ' : 'chưa đúng hoặc chưa đăng ký') + ' · tin chờ: ' + (tg.webhook.pendingUpdateCount || 0));
+          if (tg.webhook.lastDeliveryError) lines.push('Lỗi giao tin gần nhất: ' + tg.webhook.lastDeliveryError);
+          if (tg.webhook.checkError) lines.push('Lỗi kiểm tra webhook: ' + tg.webhook.checkError);
+        }
+        document.querySelector('#telegram-state').textContent = lines.join('\\n');
         drawAccounts(data.accounts);
       } catch {}
     }
@@ -303,7 +330,7 @@ export function startWebServer({
       if (req.method === 'POST' && url.pathname.startsWith('/telegram-webhook/')) {
         const handler = webhookHandlers?.get(url.pathname);
         if (handler) {
-          handler(req, res);
+          await handler(req, res);
           return;
         }
         send(res, 404, 'Webhook path not registered\n', { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -442,7 +469,10 @@ export function startWebServer({
       send(res, 404, 'Not found\n', { 'Content-Type': 'text/plain; charset=utf-8' });
     } catch (error) {
       logger?.error({ error }, 'Web server request failed');
-      send(res, 500, 'Internal server error\n', { 'Content-Type': 'text/plain; charset=utf-8' });
+      if (!res.writableEnded) {
+        if (res.headersSent) res.end();
+        else send(res, 500, 'Internal server error\n', { 'Content-Type': 'text/plain; charset=utf-8' });
+      }
     }
   });
 
