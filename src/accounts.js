@@ -43,6 +43,7 @@ export function normalizeAccount(input, baseDir = process.cwd()) {
     label: String(input.label || input.name || 'Zalo account'),
     telegramBotToken: String(input.telegramBotToken || process.env.TELEGRAM_BOT_TOKEN || '').trim(),
     telegramForumChatId,
+    telegramForumChatIdOverride: input.telegramForumChatIdOverride === true,
     allowedTelegramUserIds: String(input.allowedTelegramUserIds || process.env.ALLOWED_TELEGRAM_USER_IDS || '').trim(),
     mongoUri: String(input.mongoUri || process.env.MONGODB_URI || '').trim(),
     mongoDbName: String(input.mongoDbName || process.env.MONGODB_DB_NAME || 'zalo-to-tele').trim(),

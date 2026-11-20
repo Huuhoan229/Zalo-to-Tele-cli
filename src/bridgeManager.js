@@ -61,6 +61,8 @@ export class BridgeManager extends EventEmitter {
       conversationCount: controller?.getConversationList().length || safeAccount.conversationCount || 0,
       qrImageBase64: controller?.qrImageBase64 || null,
       listenerConnected: Boolean(controller?.listenerConnected),
+      lastAiError: controller?.lastAiError || null,
+      lastAiReplyAt: controller?.lastAiReplyAt || null,
       accountName:
         controller?.zalo?.selfProfile?.displayName ||
         controller?.zalo?.selfProfile?.zaloName ||
@@ -78,6 +80,10 @@ export class BridgeManager extends EventEmitter {
       const merged = configured ? { ...account, ...configured } : account;
       return normalizeAccount({
         ...merged,
+        ...(account.telegramForumChatIdOverride ? {
+          telegramForumChatId: account.telegramForumChatId,
+          telegramForumChatIdOverride: true,
+        } : {}),
         // Deployment-level access control must override stale Mongo registry values.
         ...(process.env.ALLOWED_TELEGRAM_USER_IDS !== undefined
           ? { allowedTelegramUserIds: process.env.ALLOWED_TELEGRAM_USER_IDS }
@@ -117,6 +123,7 @@ export class BridgeManager extends EventEmitter {
             id: account.id,
             label: account.label,
             telegramForumChatId: account.telegramForumChatId,
+            telegramForumChatIdOverride: account.telegramForumChatIdOverride,
             allowedTelegramUserIds: account.allowedTelegramUserIds,
             mongoDbName: account.mongoDbName,
             mongoCollectionName: account.mongoCollectionName,
@@ -265,6 +272,7 @@ export class BridgeManager extends EventEmitter {
       this.emit('transcript', event);
       this.emitState();
     });
+    controller.on('aiError', (event) => this.emit('aiError', event));
 
     controller.on('change', () => {
       const displayName =
@@ -405,6 +413,20 @@ export class BridgeManager extends EventEmitter {
     });
   }
 
+  async testAi(accountId) {
+    const account = this.getAccount(accountId);
+    if (!account) throw new Error('Không tìm thấy tài khoản Zalo.');
+    const mode = await this.getZaloAiMode(accountId);
+    const controller = this.getController(accountId);
+    const answer = await completeChat({
+      baseUrl: process.env.AI_BASE_URL || process.env.ROUTER_BASE_URL,
+      apiKey: process.env.AI_API_KEY || process.env.ROUTER_API_KEY,
+      model: process.env.AI_MODEL || process.env.DEFAULT_MODEL,
+      text: 'Đây là kiểm tra kết nối. Chỉ trả lời OK.',
+    });
+    return { mode, answer, connected: controller?.status === 'running' && controller?.listenerConnected };
+  }
+
   isAiAdmin(userId) {
     const admins = String(process.env.TELEGRAM_ADMIN_IDS || '')
       .split(',').map((item) => item.trim()).filter(Boolean).map(Number);
@@ -427,6 +449,43 @@ export class BridgeManager extends EventEmitter {
   async setZaloAiMode(mode, accountId = null) {
     if (!['off', 'command', 'dm', 'all'].includes(mode)) throw new Error('Chế độ AI không hợp lệ.');
     return this.withAiStore((store) => store.setZaloAiMode(mode), accountId);
+  }
+
+  async setTelegramForum(accountId, chatId) {
+    const numericId = Number(chatId);
+    if (!Number.isSafeInteger(numericId) || numericId >= 0) throw new Error('ID nhóm Telegram phải là số âm, thường bắt đầu -100.');
+    const account = this.getAccount(accountId);
+    if (!account) throw new Error('Không tìm thấy tài khoản Zalo.');
+    const wasStarted = Boolean(this.getController(accountId));
+    const previousId = account.telegramForumChatId;
+    if (Number(previousId) === numericId) return account;
+    await this.stopAccount(accountId);
+    await this.withAiStore((store) => store.switchTelegramForum(previousId, numericId), accountId);
+    const updated = await this.updateAccount(accountId, { telegramForumChatId: numericId, telegramForumChatIdOverride: true });
+    if (wasStarted) await this.startAccount(accountId);
+    return updated;
+  }
+
+  async listAccountConversations(accountId) {
+    return this.withAiStore((store) => store.listMappings(), accountId);
+  }
+
+  async bindTelegramTopic(accountId, conversationId, topicId) {
+    const account = this.getAccount(accountId);
+    const numericTopicId = Number(topicId);
+    if (!account) throw new Error('Không tìm thấy tài khoản Zalo.');
+    if (!Number.isSafeInteger(numericTopicId) || numericTopicId <= 0) throw new Error('Topic ID phải là số nguyên dương.');
+    for (const other of this.accounts) {
+      if (other.id === accountId || other.telegramBotToken !== account.telegramBotToken ||
+          Number(other.telegramForumChatId) !== Number(account.telegramForumChatId)) continue;
+      const existing = await this.withAiStore((store) => store.getByTopic(numericTopicId), other.id);
+      if (existing) throw new Error(`Topic này đã thuộc tài khoản ${other.id}. Chọn topic riêng để gửi trả đúng Zalo.`);
+    }
+    return this.withAiStore(async (store) => {
+      const mapping = store.getByConversation(conversationId);
+      if (!mapping) throw new Error('Chưa thấy cuộc trò chuyện này. Gửi một tin từ Zalo để bridge nhận trước.');
+      return store.upsertMapping({ ...mapping, topicId: numericTopicId });
+    }, accountId);
   }
 
   async getZaloAiMode(accountId = null) {

@@ -313,6 +313,10 @@ export class Store {
   }
 
   async upsertMapping(mapping) {
+    const topicOwner = this.getByTopic(mapping.topicId);
+    if (topicOwner && String(topicOwner.conversationId) !== String(mapping.conversationId)) {
+      throw new Error('Topic này đã được gán cho cuộc trò chuyện Zalo khác.');
+    }
     const normalized = {
       conversationId: String(mapping.conversationId),
       threadType: mapping.threadType,
@@ -330,6 +334,24 @@ export class Store {
     this.state.topics[String(normalized.topicId)] = normalized;
     await this.save();
     return normalized;
+  }
+
+  async switchTelegramForum(previousChatId, nextChatId) {
+    if (Number(previousChatId) === Number(nextChatId)) return;
+    this.state.telegramDestinations ||= {};
+    this.state.telegramDestinations[String(previousChatId)] = {
+      conversations: structuredClone(this.state.conversations),
+      topics: structuredClone(this.state.topics),
+    };
+    const restored = this.state.telegramDestinations[String(nextChatId)];
+    this.state.conversations = structuredClone(restored?.conversations || {});
+    this.state.topics = structuredClone(restored?.topics || {});
+    // Telegram message IDs are scoped to a chat. Do not reuse old quotes/dedupe
+    // records when switching groups; session and AI history remain intact.
+    this.state.bridgeHistoryByChat ||= {};
+    this.state.bridgeHistoryByChat[String(previousChatId)] = structuredClone(this.state.messages);
+    this.state.messages = structuredClone(this.state.bridgeHistoryByChat[String(nextChatId)] || {});
+    await this.save();
   }
 
   async appendMessage(conversationId, message) {

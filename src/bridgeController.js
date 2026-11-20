@@ -40,6 +40,8 @@ export class BridgeController extends EventEmitter {
     this.telegram = null;
     this.status = 'idle';
     this.lastError = null;
+    this.lastAiError = null;
+    this.lastAiReplyAt = null;
     this.startedAt = null;
     this.pendingEchoes = new Map();
     this.manualStop = false;
@@ -182,13 +184,20 @@ export class BridgeController extends EventEmitter {
       });
 
       this.zalo.onMessage(async (message) => {
-        if (message.isSelf && this.consumePendingEcho(message.conversationId)) {
+        const explicitAiRequest = /^\/(?:ask|ai)(?:@\w+)?(?:\s|$)/i.test(String(message.text || '').trim());
+        if (message.isSelf && this.consumePendingEcho(message.conversationId, message.text, explicitAiRequest)) {
           return;
         }
 
         await this.queueForOcr(message);
-        await this.telegram.forwardZaloMessage(message);
-        await this.maybeReplyWithAi(message);
+        // AI delivery must not depend on Telegram topic creation or permissions.
+        const results = await Promise.allSettled([
+          this.telegram.forwardZaloMessage(message),
+          this.maybeReplyWithAi(message),
+        ]);
+        for (const result of results) {
+          if (result.status === 'rejected') this.logger.error({ error: result.reason }, 'Could not process incoming Zalo message.');
+        }
         await this.relayToLocalIngest(message);
       });
 
@@ -395,16 +404,19 @@ export class BridgeController extends EventEmitter {
     }
   }
 
-  registerPendingEcho(conversationId) {
+  registerPendingEcho(conversationId, expectedText = null) {
     const key = String(conversationId);
-    const current = this.pendingEchoes.get(key) || { count: 0, expiresAt: 0 };
+    const saved = this.pendingEchoes.get(key);
+    const texts = saved?.expiresAt >= Date.now() ? [...(saved.texts || Array(saved.count).fill(null))] : [];
+    texts.push(expectedText);
     this.pendingEchoes.set(key, {
-      count: current.count + 1,
+      count: texts.length,
+      texts,
       expiresAt: Date.now() + 15000,
     });
   }
 
-  consumePendingEcho(conversationId) {
+  consumePendingEcho(conversationId, messageText = null, exactOnly = false) {
     const key = String(conversationId);
     const current = this.pendingEchoes.get(key);
     if (!current) return false;
@@ -412,11 +424,16 @@ export class BridgeController extends EventEmitter {
       this.pendingEchoes.delete(key);
       return false;
     }
-    if (current.count <= 1) {
+    const texts = current.texts || Array(current.count).fill(null);
+    const index = exactOnly ? texts.findIndex((text) => text !== null && text === messageText) : 0;
+    if (index < 0) return false;
+    texts.splice(index, 1);
+    if (texts.length === 0) {
       this.pendingEchoes.delete(key);
     } else {
       this.pendingEchoes.set(key, {
-        count: current.count - 1,
+        count: texts.length,
+        texts,
         expiresAt: current.expiresAt,
       });
     }
@@ -502,7 +519,7 @@ export class BridgeController extends EventEmitter {
   }
 
   async maybeReplyWithAi(message) {
-    if (!message || message.isSelf || (!message.text?.trim() && !message.attachment?.url)) return;
+    if (!message || (!message.text?.trim() && !message.attachment?.url)) return;
     const mode = this.getZaloAiMode();
     if (mode === 'off') return;
     const raw = message.raw?.data || {};
@@ -511,6 +528,7 @@ export class BridgeController extends EventEmitter {
     );
     const messageText = String(message.text || '').trim();
     const commandMatch = /^\/(?:ask|ai)(?:@[\w]+)?(?:\s+|$)/i.exec(messageText);
+    if (message.isSelf && !commandMatch) return;
     let prompt = messageText || 'Mô tả và trả lời về hình ảnh người dùng gửi.';
     let shouldReply = false;
     if (commandMatch) {
@@ -537,12 +555,46 @@ export class BridgeController extends EventEmitter {
         imageUrls: message.attachment?.url ? [message.attachment.url] : [],
       });
       if (this.manualStop || this.getZaloAiMode() === 'off') return;
-      await this.store.appendZaloAiTurn(message.conversationId, prompt, answer);
       for (let offset = 0; offset < answer.length; offset += 3000) {
-        await this.sendText(message.conversationId, answer.slice(offset, offset + 3000));
+        this.registerPendingEcho(message.conversationId, answer.slice(offset, offset + 3000));
+        try {
+          await this.zalo.sendText({
+            conversationId: message.conversationId,
+            threadType: message.threadType,
+            text: answer.slice(offset, offset + 3000),
+          });
+        } catch (error) {
+          this.consumePendingEcho(message.conversationId);
+          throw error;
+        }
       }
+      await this.store.appendZaloAiTurn(message.conversationId, prompt, answer);
+      const mapping = this.store.getByConversation(message.conversationId);
+      if (mapping) {
+        await this.recordTranscript(mapping, {
+          direction: 'out', source: 'ai', senderName: 'AI', text: answer,
+          attachment: null, threadType: message.threadType,
+        });
+        try {
+          await this.telegram?.sendZaloMessageToTelegram(mapping, {
+            ...message, text: answer, isSelf: true, senderName: 'AI',
+            attachment: null, replyTo: null,
+          });
+        } catch (error) {
+          this.logger.warn({ error }, 'AI replied to Zalo but could not mirror its answer to Telegram.');
+        }
+      }
+      this.lastAiError = null;
+      this.lastAiReplyAt = new Date().toISOString();
+      this.emitChange();
     } catch (error) {
+      const apiKey = process.env.AI_API_KEY || process.env.ROUTER_API_KEY;
+      this.lastAiError = String(error?.message || error);
+      if (apiKey) this.lastAiError = this.lastAiError.replaceAll(apiKey, '[redacted]');
+      this.lastAiError = this.lastAiError.slice(0, 500);
       this.logger.error({ error, conversationId: message.conversationId }, 'Could not answer Zalo message with AI.');
+      this.emit('aiError', { accountId: this.account.id, error: this.lastAiError });
+      this.emitChange();
     }
   }
 
@@ -564,6 +616,8 @@ export class BridgeController extends EventEmitter {
       qrImageBase64: this.qrImageBase64,
       listenerConnected: this.listenerConnected,
       zaloAiMode: this.getZaloAiMode(),
+      lastAiError: this.lastAiError,
+      lastAiReplyAt: this.lastAiReplyAt,
       conversations: this.getConversationList(),
     };
   }

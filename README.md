@@ -1,6 +1,6 @@
 # Zalo-to-Tele CLI
 
-Bridge one or more personal Zalo accounts to one Telegram forum group.
+Bridge one or more personal Zalo accounts to Telegram forum groups, using a shared management bot. Accounts inherit the default forum group and can select their own group from Telegram.
 
 Current deployment: this bridge runs on **Koyeb** with **MongoDB**; the separate `9router-tele-render` repository runs on **Render** as the AI API. Keep the two existing services. Render deployment for this bridge is an optional alternative.
 
@@ -320,6 +320,10 @@ If `WEB_ACCESS_TOKEN` is set, open URLs with `?token=YOUR_TOKEN` or send it as a
 - `/allowai <telegram_user_id>`, `/denyai <telegram_user_id>`, `/aiusers` manage AI-only Telegram access.
 - `/zaloqr [account_id]`, `/addzalo [label]`, `/zaloaccounts`, `/zalostart <account_id>`, and `/zalostop <account_id>` manage Zalo accounts.
 - `/zaloai off|command|dm|all [account_id]` controls AI auto-replies for one account.
+- `/telegram <account_id>` shows the bot and destination group for that account.
+- `/setforum <account_id> <-100...>` sets a forum group after checking the bot's Manage Topics permission.
+- `/bindtopic <account_id> <zalo_conversation_id> <topic_id>` binds a known conversation to an existing topic.
+- `/aitest <account_id>` tests the configured 9Router endpoint, key, and model and reports that account's AI mode.
 
 ## Telegram Management Menu and AI
 
@@ -344,6 +348,14 @@ AI_SYSTEM_PROMPT=Bạn là trợ lý hữu ích. Trả lời bằng ngôn ngữ 
 ```
 
 The bot supports `/ask <câu hỏi>` and `/zaloai off|command|dm|all [account_id]`. In `command` mode, Zalo replies require `/ask`, `/ai`, or an explicit group mention; `dm` also replies to private chats; `all` replies to all incoming text messages and images. AI defaults to `off` for each Zalo account. Image analysis requires a model with vision support. AI chat history and AI access permissions are stored in a dedicated MongoDB control record; each account's Zalo AI mode stays with that account's bridge record.
+
+To test from the connected Zalo account itself, explicitly send `/ask Xin chào` or `/ai Xin chào` in a Zalo conversation while that account's AI mode is enabled. Ordinary self-authored messages and AI-generated replies are ignored to avoid loops. `off` disables even explicit self-authored AI commands. AI delivery to Zalo does not depend on Telegram topic creation succeeding. API/delivery errors appear in `/zalostatus` and are reported to Telegram admins, with repeated identical errors limited to one notification per account per minute.
+
+### Configure a Telegram group or existing topic
+
+Open `/menu` → `Tài khoản Zalo` → select an account → `Nhóm/topic Telegram`. The account uses the same bot token as the management bot by default, so adding a Zalo account does not require entering another token. The settings show the bot username and group ID, with buttons to change the group or list and rebind conversation topics. Use `/id` in the target group/topic to obtain `chat_id` and `message_thread_id`. Numeric input prompts can be cancelled with `/cancel`.
+
+Each Zalo conversation has its own topic to keep Telegram-to-Zalo replies unambiguous. The bot normally creates this topic automatically. To choose an existing topic, open `Xem/gán topic` and select the conversation. A topic already mapped to another conversation/account is rejected. Changing the destination group reconnects the bridge with its saved session and archives that group's mappings/history so switching back can restore them; it preserves Zalo credentials, AI mode, and OCR configuration. Group choices made in Telegram persist across redeploys.
 
 ### Keep Koyeb and Render as separate deployments
 
