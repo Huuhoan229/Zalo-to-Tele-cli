@@ -76,11 +76,16 @@ export class BridgeManager extends EventEmitter {
     this.accountsFilePath = file.filePath;
     const registry = await this.loadAccountsRegistry();
     const savedAccounts = registry?.accounts;
+    const localAccounts = !savedAccounts && !this.mongoUri && file.filePath === 'ACCOUNTS_JSON'
+      ? (await loadAccountsFile(this.baseDir, { ignoreEnv: true })).accounts
+      : [];
     this.accounts = (savedAccounts || file.accounts).map((account) => {
       const configured = file.accounts.find((item) => item.id === account.id);
       const merged = configured ? { ...account, ...configured } : account;
+      const renamed = account.labelOverride ? account : localAccounts.find((item) => item.id === account.id && item.labelOverride);
       return normalizeAccount({
         ...merged,
+        ...(renamed ? { label: renamed.label, labelOverride: true } : {}),
         ...(account.telegramForumChatIdOverride ? {
           telegramForumChatId: account.telegramForumChatId,
           telegramForumChatIdOverride: true,
@@ -123,6 +128,7 @@ export class BridgeManager extends EventEmitter {
           accounts: this.accounts.map((account) => ({
             id: account.id,
             label: account.label,
+            labelOverride: account.labelOverride,
             telegramForumChatId: account.telegramForumChatId,
             telegramForumChatIdOverride: account.telegramForumChatIdOverride,
             allowedTelegramUserIds: account.allowedTelegramUserIds,
@@ -208,6 +214,32 @@ export class BridgeManager extends EventEmitter {
     return next;
   }
 
+  async renameAccount(id, value) {
+    const account = this.getAccount(id);
+    if (!account) throw new Error('Không tìm thấy tài khoản Zalo.');
+    const label = String(value ?? '').trim();
+    if (!label || [...label].length > 80 || /\p{Cc}|\p{Zl}|\p{Zp}/u.test(label)) {
+      throw new Error('Tên phải có từ 1 đến 80 ký tự trên một dòng.');
+    }
+    const previous = { label: account.label, labelOverride: account.labelOverride };
+    account.label = label;
+    account.labelOverride = true;
+    try {
+      await this.persist();
+    } catch (error) {
+      if (account.label === label) Object.assign(account, previous);
+      throw error;
+    }
+    const controller = this.getController(id);
+    if (controller) {
+      controller.account.label = account.label;
+      controller.account.labelOverride = true;
+      if (controller.telegram) controller.telegram.config.accountLabel = account.label;
+    }
+    this.emitState();
+    return account;
+  }
+
   async removeAccount(id) {
     const account = this.getAccount(id);
     if (!account) throw new Error('Account not found');
@@ -281,8 +313,9 @@ export class BridgeManager extends EventEmitter {
         controller.zalo?.selfProfile?.displayName ||
         controller.zalo?.selfProfile?.zaloName ||
         '';
-      if (displayName && /^Zalo \d+$/i.test(account.label) && account.label !== displayName) {
-        account.label = String(displayName).slice(0, 80);
+      const current = this.getAccount(id);
+      if (displayName && current && !current.labelOverride && /^Zalo \d+$/i.test(current.label) && current.label !== displayName) {
+        current.label = String(displayName).slice(0, 80);
         this.persist().catch((error) => this.pushLog({
           timestamp: new Date().toISOString(),
           level: 'warn',

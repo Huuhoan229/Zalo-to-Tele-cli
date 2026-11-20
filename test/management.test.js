@@ -15,6 +15,7 @@ test('Telegram menu routes QR, permissions, and forum replies through one runtim
   const loginStatuses = [];
   const zaloSent = [];
   const modes = [];
+  const renamed = [];
   const mapping = { conversationId: 'zalo-chat', threadType: 1, topicId: 17 };
   const bridge = new TelegramBridgeBot({
     config: {
@@ -30,6 +31,7 @@ test('Telegram menu routes QR, permissions, and forum replies through one runtim
     getAccount: (id) => ({ id, label: 'Test Zalo' }),
     getZaloAiMode: async () => 'dm',
     setZaloAiMode: async (mode, id) => { modes.push([mode, id]); return mode; },
+    renameAccount: async (id, label) => { renamed.push([id, label]); return { id, label }; },
     isAiUserAllowed: async (id) => id === 222,
     requestZaloQr: async (_onQr, id, onStatus) => { qrRequests.push(id); loginStatuses.push(onStatus); },
     chatWithAi: async (_id, prompt) => `AI: ${prompt}`,
@@ -64,6 +66,17 @@ test('Telegram menu routes QR, permissions, and forum replies through one runtim
   await dispatch('/menu');
   assert.ok(sent.at(-1).extra.reply_markup.keyboard.flat().some((item) => (item.text || item) === '🔗 Kết nối Zalo'));
   telegram.answerCbQuery = async () => {};
+  await dispatch('', 111, false, 'zalo:account:zalo-1');
+  assert.ok(sent.at(-1).extra.reply_markup.inline_keyboard.flat().some((button) => button.text === 'Đổi tên hiển thị'));
+  await dispatch('', 222, false, 'zalo:rename:zalo-1');
+  assert.equal(runtime.pendingSettings.has(222), false);
+  await dispatch('', 111, false, 'zalo:rename:zalo-1');
+  await dispatch('/cancel');
+  assert.equal(runtime.pendingSettings.has(111), false);
+  await dispatch('', 111, false, 'zalo:rename:zalo-1');
+  await dispatch('  Tài khoản gia đình  ');
+  assert.deepEqual(renamed, [['zalo-1', 'Tài khoản gia đình']]);
+  assert.match(sent.at(-1).text, /Đã đổi tên hiển thị thành “Tài khoản gia đình” \(zalo-1\)/);
   await dispatch('/zalomode');
   assert.match(sent.at(-1).text, /\/zalomode command zalo-1/);
   await dispatch('', 111, false, 'zalo:modes:zalo-1');
@@ -99,6 +112,53 @@ test('Telegram menu routes QR, permissions, and forum replies through one runtim
   await dispatch('blocked', 222, true);
   assert.equal(zaloSent.length, 1);
   runtime.removeBridge(bridge);
+});
+
+test('a renamed account keeps its display name and ID after reloading against ACCOUNTS_JSON', async (t) => {
+  const baseDir = await mkdtemp(path.join(os.tmpdir(), 'zalo-display-name-'));
+  const previous = process.env.ACCOUNTS_JSON;
+  process.env.ACCOUNTS_JSON = JSON.stringify([{ id: 'zalo1', label: 'HJ', telegramForumChatId: -1001 }]);
+  t.after(async () => {
+    if (previous === undefined) delete process.env.ACCOUNTS_JSON; else process.env.ACCOUNTS_JSON = previous;
+    await rm(baseDir, { recursive: true, force: true });
+  });
+  let registry;
+  const collection = {
+    findOne: async () => registry,
+    replaceOne: async (_filter, value) => { registry = value; },
+  };
+  for (const mongo of [true, false]) {
+    function createManager() {
+      const manager = new BridgeManager({ baseDir });
+      manager.mongoUri = mongo ? 'mongodb://mock.invalid' : '';
+      if (mongo) {
+        manager.accountsCollection = collection;
+        manager.controlStore = null;
+        if (!registry) manager.accounts = [{ id: 'zalo1', label: 'HJ', telegramForumChatId: -1001 }];
+      }
+      return manager;
+    }
+    const manager = createManager();
+    const loaded = createManager();
+    try {
+      if (!mongo) await manager.load();
+      const original = manager.getAccount('zalo1');
+      await assert.rejects(manager.renameAccount(original.id, '  '), /1 đến 80/);
+      await manager.renameAccount(original.id, 'Zalo 2');
+      if (mongo) {
+        // The registry uses Mongo on Koyeb; keep the unrelated AI control store local in the test.
+        loaded.loadAccountsRegistry = async () => registry;
+        loaded.mongoUri = '';
+      }
+      await loaded.load();
+      assert.deepEqual((await loaded.listAccounts()).map(({ id, label, telegramForumChatId }) => [id, label, telegramForumChatId]), [
+        ['zalo1', 'Zalo 2', -1001],
+      ]);
+    } finally {
+      await manager.stopAll();
+      await loaded.stopAll();
+    }
+  }
 });
 
 test('AI permissions and histories survive reload without requiring a connected Zalo account', async () => {

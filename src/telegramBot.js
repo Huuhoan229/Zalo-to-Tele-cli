@@ -684,6 +684,7 @@ class SharedTelegramRuntime {
       const account = this.manager?.getAccount(id);
       if (!account) return ctx.reply('Không tìm thấy tài khoản này.');
       const rows = [
+        [Markup.button.callback('Đổi tên hiển thị', `zalo:rename:${id}`)],
         [Markup.button.callback('🔄 Quét lại QR', `zalo:qr:${id}`)],
         [Markup.button.callback('▶️ Bật', `zalo:start:${id}`), Markup.button.callback('⏸ Tắt', `zalo:stop:${id}`)],
         [Markup.button.callback('🤖 Chế độ AI', `zalo:modes:${id}`)],
@@ -691,6 +692,14 @@ class SharedTelegramRuntime {
         [Markup.button.callback('🧪 Kiểm tra AI', `zalo:aitest:${id}`)],
       ];
       await ctx.reply(`${account.label} (${id})`, Markup.inlineKeyboard(rows));
+    });
+    this.bot.action(/^zalo:rename:(.+)$/, async (ctx) => {
+      if (!isAdmin(ctx) || ctx.chat?.type !== 'private') return ctx.answerCbQuery('Chỉ admin được dùng trong chat riêng với bot.');
+      await ctx.answerCbQuery();
+      const account = this.manager?.getAccount(ctx.match[1]);
+      if (!account) return ctx.reply('Không tìm thấy tài khoản này.');
+      this.pendingSettings.set(ctx.from.id, { kind: 'rename', accountId: account.id, expires: Date.now() + 300000 });
+      await ctx.reply(`Tên hiện tại của ${account.id}: ${account.label}\nGửi tên mới hoặc /cancel để hủy.`);
     });
     this.bot.action(/^zalo:qr:(.+)$/, async (ctx) => {
       if (!isAdmin(ctx) || ctx.chat?.type !== 'private') return ctx.answerCbQuery('Chỉ admin được dùng trong chat riêng với bot.');
@@ -826,7 +835,17 @@ class SharedTelegramRuntime {
       if (pending && isAdmin(ctx)) {
         if (Date.now() > pending.expires) {
           this.pendingSettings.delete(ctx.from.id);
-          return ctx.reply('Thao tác nhập cấu hình đã hết hạn. Hãy mở lại mục Nhóm/topic Telegram.');
+          return ctx.reply('Thao tác đã hết hạn. Hãy mở lại mục vừa chọn trong menu tài khoản.');
+        }
+        if (pending.kind === 'rename') {
+          let account;
+          try {
+            account = await this.manager.renameAccount(pending.accountId, text);
+          } catch (error) {
+            return ctx.reply(`Không đổi được tên: ${humanError(error)}\nGửi lại tên hoặc /cancel.`);
+          }
+          if (this.pendingSettings.get(ctx.from.id) === pending) this.pendingSettings.delete(ctx.from.id);
+          return showMenu(ctx, `Đã đổi tên hiển thị thành “${account.label}” (${account.id}).`);
         }
         try {
           if (pending.kind === 'forum') await saveForum(ctx, pending.accountId, text);

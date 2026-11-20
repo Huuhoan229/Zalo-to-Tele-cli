@@ -333,6 +333,7 @@ Open a private chat with the bot and use `/start` or `/menu`. The menu provides:
 
 - `Chat với AI`: sends questions to an OpenAI-compatible endpoint, including a 9Router deployment.
 - `Kết nối Zalo`: starts QR login for the configured Zalo account.
+- `Tài khoản Zalo` → select an account → `Đổi tên hiển thị`: set a saved display name for the account in the bot. The account ID, Zalo profile name, and existing topic mappings stay the same.
 - `Bật/tắt AI Zalo`: opens the account list. Select an account, then open `Chế độ AI` to choose `off`, `command`, `dm`, or `all`.
 - `Trạng thái`: shows the Zalo listener and current AI mode.
 

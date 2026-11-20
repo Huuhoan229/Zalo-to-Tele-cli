@@ -41,6 +41,7 @@ export function normalizeAccount(input, baseDir = process.cwd()) {
   return {
     id,
     label: String(input.label || input.name || 'Zalo account'),
+    labelOverride: input.labelOverride === true,
     telegramBotToken: String(input.telegramBotToken || process.env.TELEGRAM_BOT_TOKEN || '').trim(),
     telegramForumChatId,
     telegramForumChatIdOverride: input.telegramForumChatIdOverride === true,
@@ -124,8 +125,8 @@ function loadAccountsFromEnv() {
   };
 }
 
-export async function loadAccountsFile(baseDir = process.cwd()) {
-  const envAccounts = loadAccountsFromEnv();
+export async function loadAccountsFile(baseDir = process.cwd(), { ignoreEnv = false } = {}) {
+  const envAccounts = ignoreEnv ? null : loadAccountsFromEnv();
   if (envAccounts) return envAccounts;
 
   const filePath = path.join(baseDir, 'data', 'accounts.json');
