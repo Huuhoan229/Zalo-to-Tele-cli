@@ -9,7 +9,7 @@ Current deployment: this bridge runs on **Koyeb** with **MongoDB**; the separate
 ## What It Does
 
 - Receives messages from Zalo and forwards them into Telegram forum topics.
-- Sends Telegram replies, photos, and image documents back to the correct Zalo conversation.
+- Sends Telegram replies, photos, and file documents (PDF, Word, Excel, ZIP, etc.) back to the correct Zalo conversation.
 - Creates one Telegram topic per Zalo conversation.
 - Supports multiple Zalo accounts with one Telegram bot and one Telegram forum group.
 - Stores Zalo sessions and Telegram topic mappings in MongoDB across Koyeb or Render redeploys.
@@ -20,7 +20,7 @@ Current deployment: this bridge runs on **Koyeb** with **MongoDB**; the separate
 
 ```text
 Zalo account -> Zalo conversation -> Telegram forum topic
-Telegram topic reply/photo -> same Zalo account -> same Zalo conversation
+Telegram topic reply/photo/document -> same Zalo account -> same Zalo conversation
 ```
 
 When a Zalo message arrives for the first time, the bot creates a Telegram topic.
@@ -77,7 +77,9 @@ ALLOWED_TELEGRAM_USER_IDS=123456789
 
 Find your numeric Telegram user ID by sending `/id` in the forum group. For multiple users, use a comma-separated list. Save the changes and redeploy the bridge service. This deployment variable overrides any older allowlist value saved in the MongoDB account registry.
 
-To send a Zalo message, send text in the Telegram forum topic linked to that Zalo conversation. Photos and image documents are also forwarded. The Telegram bot and mapped Zalo account must both be running. If sending fails, the bot replies in the topic with the permission or delivery error.
+To send a Zalo message, send text in the Telegram forum topic linked to that Zalo conversation. Photos and documents such as PDF, Word, Excel, ZIP, and text files are also forwarded, including their captions. Send files using Telegram's File/Document option. Non-image documents retain their file names (unsafe filename characters may be replaced). The Telegram bot and mapped Zalo account must both be running. If sending fails, the bot replies in the topic with the permission or delivery error.
+
+The hosted Telegram Bot API lets bots download files up to 20 MB, so this bridge rejects larger files with an explicit message. Zalo may also reject restricted file types or uploads. Temporary downloads are removed after sending. No additional environment variables are required.
 
 If a message does not reach Zalo, check that it is in the correct mapped topic, the Zalo account is running, and your numeric Telegram user ID is included in `ALLOWED_TELEGRAM_USER_IDS`. Use `/topics` to inspect topic mappings and `/id` to check the sender ID. The bridge service logs show delivery errors; the bot also replies with the returned error in the topic.
 

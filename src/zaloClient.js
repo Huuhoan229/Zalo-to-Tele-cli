@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { LoginQRCallbackEventType, Zalo, ThreadType } from 'zca-js';
-import { imageMetadataGetter } from './media.js';
+import { imageMetadataGetter, safeFilename } from './media.js';
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -389,5 +389,19 @@ export class ZaloClient extends EventEmitter {
       ...(quote ? { quote } : {}),
     };
     await this.api.sendMessage(payload, conversationId, threadType);
+  }
+
+  async sendFile({ conversationId, threadType, filePath, filename, caption, quote = null }) {
+    if (!this.api) throw new Error('Zalo is not connected');
+    const data = await fs.readFile(filePath);
+    await this.api.sendMessage({
+      msg: caption || '',
+      attachments: [{
+        data,
+        filename: safeFilename(filename, path.basename(filePath)),
+        metadata: { totalSize: data.length },
+      }],
+      ...(quote ? { quote } : {}),
+    }, conversationId, threadType);
   }
 }

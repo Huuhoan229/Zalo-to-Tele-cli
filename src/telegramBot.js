@@ -7,6 +7,7 @@ import { boundTelegramApi, BoundedTelegramContext, normalizedMenuText } from './
 import { TelegramGroupQueue, telegramRateLimitSeconds } from './telegramGroupQueue.js';
 
 const runtimes = new Map();
+const MAX_TELEGRAM_DOWNLOAD_BYTES = 20 * 1024 * 1024;
 
 /**
  * Global registry: webhookPath → Telegraf webhookCallback handler.
@@ -948,7 +949,7 @@ class SharedTelegramRuntime {
     if (![...this.bridges].some((bridge) => Number(bridge.config.telegramForumChatId) === Number(ctx.chat?.id))) return;
     if (!ctx.message.message_thread_id) {
       if (type !== 'text') {
-        await ctx.reply('Ảnh này chưa nằm trong topic Zalo nào nên không biết gửi về đâu.');
+        await ctx.reply('Tệp này chưa nằm trong topic Zalo nào nên không biết gửi về đâu.');
       }
       return;
     }
@@ -1339,7 +1340,7 @@ export class TelegramBridgeBot {
   async forwardTelegramDocument(ctx, mapped = null) {
     if (ctx.chat?.id !== this.config.telegramForumChatId) return;
     if (!ctx.message.message_thread_id) {
-      await ctx.reply('Ảnh này chưa nằm trong topic Zalo nào nên không biết gửi về đâu.');
+      await ctx.reply('Tệp này chưa nằm trong topic Zalo nào nên không biết gửi về đâu.');
       return;
     }
     if (!isAllowed(this.config, ctx.from.id)) {
@@ -1348,8 +1349,6 @@ export class TelegramBridgeBot {
       );
       return;
     }
-    if (!ctx.message.document.mime_type?.startsWith('image/')) return;
-
     const mapping = mapped || this.store.getByTopic(ctx.message.message_thread_id);
     if (!mapping) {
       await ctx.reply('Topic này chưa được map với cuộc trò chuyện Zalo nào.');
@@ -1359,38 +1358,43 @@ export class TelegramBridgeBot {
       ? this.store.getReplyData(ctx.message.reply_to_message.message_id)
       : null;
 
-    const extension = ctx.message.document.file_name?.split('.').pop() || 'jpg';
+    const document = ctx.message.document;
+    const isImage = document.mime_type?.startsWith('image/');
+    const extension = document.file_name?.split('.').at(-1) || (isImage ? 'jpg' : 'bin');
+    const filename = document.file_name || `file-${document.file_unique_id}.${isImage ? 'jpg' : 'bin'}`;
     const targetPath = await this.downloadTelegramFile(
       ctx,
-      ctx.message.document.file_id,
-      ctx.message.document.file_unique_id,
+      document.file_id,
+      document.file_unique_id,
       extension,
+      document.file_size,
     );
     this.logger.info(
       { topicId: ctx.message.message_thread_id, conversationId: mapping.conversationId, filePath: targetPath },
-      'Downloaded Telegram image document for Zalo forwarding.',
+      'Downloaded Telegram document for Zalo forwarding.',
     );
 
     this.pendingEcho?.register?.(mapping.conversationId);
     try {
-      await this.zalo.sendImage({
+      const send = isImage ? this.zalo.sendImage.bind(this.zalo) : this.zalo.sendFile.bind(this.zalo);
+      await send({
         conversationId: mapping.conversationId,
         threadType: mapping.threadType,
         filePath: targetPath,
+        filename,
         caption: ctx.message.caption,
         quote,
       });
       this.logger.info(
         { topicId: ctx.message.message_thread_id, conversationId: mapping.conversationId },
-        'Forwarded Telegram image document to Zalo.',
+        'Forwarded Telegram document to Zalo.',
       );
     } catch (error) {
       this.pendingEcho?.consume?.(mapping.conversationId);
       this.logger.error(
         { error, topicId: ctx.message.message_thread_id, conversationId: mapping.conversationId },
-        'Could not forward Telegram image document to Zalo.',
+        'Could not forward Telegram document to Zalo.',
       );
-      await ctx.reply(`Không gửi được ảnh sang Zalo.\n${humanError(error)}`);
       throw error;
     } finally {
       await this.cleanupTelegramFile(targetPath);
@@ -1401,24 +1405,39 @@ export class TelegramBridgeBot {
       senderName: telegramSenderName(ctx),
       text: ctx.message.caption || '',
       attachment: {
-        title: ctx.message.document.file_name || 'image',
+        title: filename,
+        type: isImage ? 'image' : 'file',
       },
       threadType: mapping.threadType,
     });
   }
 
-  async downloadTelegramFile(ctx, fileId, uniqueId, fallbackExtension) {
+  async downloadTelegramFile(ctx, fileId, uniqueId, fallbackExtension, fileSize) {
+    const sizeError = () => new Error('Tệp vượt giới hạn tải 20 MB của Telegram Bot API nên chưa gửi được sang Zalo. Hãy gửi tệp nhỏ hơn hoặc chia nhỏ tệp.');
+    if (fileSize > MAX_TELEGRAM_DOWNLOAD_BYTES) throw sizeError();
     const fileLink = await ctx.telegram.getFileLink(fileId);
-    const extension = fileLink.pathname.split('.').pop() || fallbackExtension;
+    // getFile links need not preserve the original name or extension.
+    const extension = /^[a-z0-9]{1,16}$/i.test(fallbackExtension || '') ? fallbackExtension : 'bin';
     const targetPath = uniqueDownloadPath(this.config.downloadDir, `telegram-${uniqueId}`, extension);
     await ensureDir(this.config.downloadDir);
 
-    const response = await fetch(fileLink);
+    const response = await fetch(fileLink, { signal: AbortSignal.timeout(60000) });
     if (!response.ok) {
       throw new Error(`Failed to download Telegram file: ${response.status} ${response.statusText}`);
     }
 
-    await fs.writeFile(targetPath, Buffer.from(await response.arrayBuffer()));
+    if (Number(response.headers.get('content-length')) > MAX_TELEGRAM_DOWNLOAD_BYTES) {
+      await response.body?.cancel();
+      throw sizeError();
+    }
+    const data = Buffer.from(await response.arrayBuffer());
+    if (data.length > MAX_TELEGRAM_DOWNLOAD_BYTES) throw sizeError();
+    try {
+      await fs.writeFile(targetPath, data);
+    } catch (error) {
+      await this.cleanupTelegramFile(targetPath);
+      throw error;
+    }
     return targetPath;
   }
 
