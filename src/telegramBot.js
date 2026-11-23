@@ -55,17 +55,90 @@ async function readJsonBody(req, maxBytes = 1024 * 1024) {
 }
 
 function updateChatKey(update) {
-  const chat = update?.message?.chat || update?.callback_query?.message?.chat || update?.edited_message?.chat;
+  const chat = update?.message?.chat || update?.callback_query?.message?.chat || update?.edited_message?.chat || update?.message_reaction?.chat;
   return chat?.id !== undefined ? String(chat.id) : 'global';
 }
 
 const MAX_ZALO_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'webp']);
 const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'm4v']);
+const VOICE_EXTENSIONS = new Set(['ogg', 'opus', 'm4a', 'aac']);
+const AUDIO_EXTENSIONS = new Set(['mp3', 'wav', 'flac']);
 const MIME_EXTENSIONS = {
   'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif',
-  'video/mp4': 'mp4', 'application/pdf': 'pdf', 'text/plain': 'txt', 'application/zip': 'zip',
+  'video/mp4': 'mp4', 'video/quicktime': 'mov',
+  'audio/ogg': 'ogg', 'audio/opus': 'ogg', 'audio/mp4': 'm4a', 'audio/x-m4a': 'm4a',
+  'audio/aac': 'aac', 'audio/mpeg': 'mp3', 'audio/mp3': 'mp3', 'audio/wav': 'wav',
+  'application/pdf': 'pdf', 'text/plain': 'txt', 'application/zip': 'zip',
 };
+
+const TELEGRAM_TO_ZALO_REACTION = new Map([
+  ['❤️', '/-heart'], ['❤', '/-heart'], ['♥️', '/-heart'], ['♥', '/-heart'], ['😍', '/-heart'], ['🥰', '/-heart'], ['💕', '/-heart'], ['💖', '/-heart'],
+  ['👍', '/-strong'], ['🔥', '/-strong'], ['💯', '/-strong'], ['⚡', '/-strong'], ['🫡', '/-strong'],
+  ['😂', ':>'], ['🤣', ':>'], ['😄', ':>'], ['😆', ':>'], ['😁', ':>'],
+  ['😮', ':o'], ['😱', ':o'], ['🤯', ':o'], ['😲', ':o'],
+  ['😢', ':-(( '].map((s) => s.trim()), ['😭', ':-(( '].map((s) => s.trim()), ['😥', ':-(( '].map((s) => s.trim()),
+  ['😡', ':-h'], ['🤬', ':-h'], ['😠', ':-h'],
+  ['👎', '/-weak'],
+  ['😘', ':-*'], ['💋', ':-*'],
+  ['💔', '/-break'],
+  ['💩', '/-shit'],
+  ['🌹', '/-rose'], ['🌸', '/-rose'],
+  ['🙏', '_()_'],
+  ['👏', ':handclap'], ['🙌', ':handclap'],
+  ['🎉', '/-bd'], ['🎂', '/-bd'], ['🥳', '/-bd'],
+  ['🍺', '/-beer'], ['🍻', '/-beer'],
+  ['👌', '/-ok'], ['✅', '/-ok'],
+  ['✌️', '/-v'], ['✌', '/-v'],
+  ['😎', 'x-)'], ['🤓', '8-)'],
+  ['🤔', ';-/'], ['😉', ';-)'],
+  ['heart', '/-heart'], ['tim', '/-heart'], ['love', '/-heart'],
+  ['like', '/-strong'],
+  ['haha', ':>'], ['cuoi', ':>'],
+  ['wow', ':o'],
+  ['sad', ':-(('], ['cry', ':-(('], ['buon', ':-(('],
+  ['angry', ':-h'], ['gian', ':-h'],
+  ['dislike', '/-weak'],
+  ['ok', '/-ok'],
+  ['off', ''], ['none', ''], ['clear', ''], ['xoa', ''],
+]);
+
+const ZALO_TO_TELEGRAM_REACTION = new Map([
+  ['/-heart', '❤'], [';xx', '❤'], ['/-loveu', '❤'],
+  ['/-strong', '👍'], ['/-ok', '👌'], ['/-v', '👍'], ['/-thanks', '🙏'],
+  [':>', '🤣'], [":')", '🤣'], [';-d', '🤣'], [':))', '🤣'],
+  [':o', '😱'], [':-o', '😱'],
+  [':-((', '😢'], ['--b', '😢'], [':((', '😢'], ['p-(', '😢'], [':-<', '😢'], ['&-(', '😢'],
+  [':-h', '😡'], ['>-|', '😡'],
+  ['/-weak', '👎'], ['/-no', '👎'], ['/-bad', '👎'],
+  [':-*', '😘'],
+  ['/-break', '💔'],
+  ['/-shit', '💩'],
+  ['/-rose', '❤'],
+  ['_()_', '🙏'],
+  [':handclap', '👏'],
+  ['/-bd', '🎉'],
+  ['/-beer', '🎉'],
+  ['x-)', '😎'], ['b-)', '😎'], ['8-)', '🤓'],
+  [';-/', '🤔'],
+  [';-)', '👌'],
+]);
+
+export function telegramReactionToZalo(input) {
+  if (input === '' || input === null || input === undefined) return '';
+  const raw = String(input).trim();
+  if (!raw) return '';
+  if (TELEGRAM_TO_ZALO_REACTION.has(raw)) return TELEGRAM_TO_ZALO_REACTION.get(raw);
+  const normalized = raw.replace(/[\uFE0E\uFE0F]/g, '').toLowerCase();
+  if (TELEGRAM_TO_ZALO_REACTION.has(normalized)) return TELEGRAM_TO_ZALO_REACTION.get(normalized);
+  return '/-heart';
+}
+
+export function zaloReactionToTelegram(rIcon) {
+  const raw = String(rIcon || '').trim();
+  if (!raw) return null;
+  return ZALO_TO_TELEGRAM_REACTION.get(raw) || '❤';
+}
 
 function fileExtension(name) {
   const match = String(name || '').toLowerCase().match(/\.([a-z0-9]{1,8})$/);
@@ -89,12 +162,16 @@ export async function downloadZaloAttachment(attachment, { fetchImpl = fetch, ti
   let filename = safeFilename(attachment.title && attachment.title !== 'attachment' && attachment.title !== 'sticker' ? attachment.title : '');
   let ext = fileExtension(filename);
   if (!ext) {
-    ext = MIME_EXTENSIONS[mime] || fileExtension(new URL(attachment.url).pathname) || (mime.startsWith('image/') ? 'jpg' : 'bin');
-    filename = `${filename || (attachment.type === 'sticker' ? 'sticker' : 'zalo-file')}.${ext}`;
+    const fallbackExt = attachment.type === 'voice' ? 'm4a' : attachment.type === 'video' ? 'mp4' : mime.startsWith('image/') ? 'jpg' : 'bin';
+    ext = MIME_EXTENSIONS[mime] || fileExtension(new URL(attachment.url).pathname) || fallbackExt;
+    const baseName = filename || (attachment.type === 'sticker' ? 'sticker' : attachment.type === 'voice' ? 'voice' : attachment.type === 'video' ? 'video' : 'zalo-file');
+    filename = `${baseName}.${ext}`;
   }
   let kind = 'document';
   if (attachment.type === 'sticker' || IMAGE_EXTENSIONS.has(ext) || (mime.startsWith('image/') && mime !== 'image/gif')) kind = 'photo';
-  else if (VIDEO_EXTENSIONS.has(ext) || mime.startsWith('video/')) kind = 'video';
+  else if (attachment.type === 'video' || VIDEO_EXTENSIONS.has(ext) || mime.startsWith('video/')) kind = 'video';
+  else if (attachment.type === 'voice' || VOICE_EXTENSIONS.has(ext) || mime === 'audio/ogg' || mime === 'audio/opus' || mime === 'audio/aac' || mime === 'audio/mp4' || mime === 'audio/x-m4a') kind = 'voice';
+  else if (AUDIO_EXTENSIONS.has(ext) || mime.startsWith('audio/')) kind = 'audio';
   return { buffer, filename, kind, mime };
 }
 
@@ -131,9 +208,15 @@ function formatZaloMessage(zaloMessage) {
   const quoted = zaloMessage.replyTo?.text
     ? `↪ Trả lời ${zaloMessage.replyTo.senderName ? `[${zaloMessage.replyTo.senderName}]` : ''}: ${zaloMessage.replyTo.text}\n\n`
     : '';
-  const body = zaloMessage.text ||
-    (zaloMessage.attachment?.type === 'sticker' ? '🎭 Sticker' : zaloMessage.attachment?.title) ||
-    '(non-text message)';
+  const defaultAttachmentLabel =
+    zaloMessage.attachment?.type === 'sticker'
+      ? '🎭 Sticker'
+      : zaloMessage.attachment?.type === 'voice'
+        ? '🎤 Tin nhắn thoại'
+        : zaloMessage.attachment?.type === 'video'
+          ? '🎬 Video'
+          : zaloMessage.attachment?.title;
+  const body = zaloMessage.text || defaultAttachmentLabel || '(non-text message)';
   return `${prefix}\n${quoted}${body}`;
 }
 
@@ -257,7 +340,7 @@ class SharedTelegramRuntime {
         let repaired = false;
         if (info.url !== expectedUrl) {
           this.logger.warn('Telegram webhook was removed or changed; restoring this deployment endpoint.');
-          await this.bot.telegram.setWebhook(expectedUrl, { drop_pending_updates: false, allowed_updates: ['message', 'callback_query'] });
+          await this.bot.telegram.setWebhook(expectedUrl, { drop_pending_updates: false, allowed_updates: ['message', 'callback_query', 'message_reaction'] });
           if (generation !== this.generation || !this.started) return;
           info = await this.bot.telegram.getWebhookInfo();
           repaired = true;
@@ -382,7 +465,7 @@ class SharedTelegramRuntime {
             if (this.updateChains.get(chatKey) === current) this.updateChains.delete(chatKey);
           });
         });
-        await this.bot.telegram.setWebhook(fullUrl, { drop_pending_updates: false, allowed_updates: ['message', 'callback_query'] });
+        await this.bot.telegram.setWebhook(fullUrl, { drop_pending_updates: false, allowed_updates: ['message', 'callback_query', 'message_reaction'] });
         if (generation !== this.generation) return;
         this.started = true;
         this.transportStatus = 'running';
@@ -448,7 +531,7 @@ class SharedTelegramRuntime {
         { command: 'topics', description: 'Liệt kê topic Zalo đã liên kết' },
         { command: 'id', description: 'Xem Telegram ID' },
       ]).catch((error) => this.logger.warn({ error }, 'Could not register Telegram command menu.'));
-      this.pollingTask = this.bot.launch({ dropPendingUpdates: false }, () => {
+      this.pollingTask = this.bot.launch({ dropPendingUpdates: false, allowedUpdates: ['message', 'callback_query', 'message_reaction'] }, () => {
         if (generation !== this.generation) throw new Error('Telegram launch cancelled');
         this.transportStatus = 'running';
         this.lastTransportError = null;
@@ -988,6 +1071,52 @@ class SharedTelegramRuntime {
       await ctx.reply(text);
     });
 
+    this.bot.command(['undo', 'recall', 'thuhoi'], async (ctx) => {
+      if (!ctx.message?.message_thread_id) {
+        return ctx.reply('Dùng /undo trong topic Zalo (có thể reply vào tin nhắn muốn thu hồi, hoặc gõ /undo để thu hồi tin vừa gửi gần nhất).');
+      }
+      const routed = this.findBridgeByTopic(ctx.message.message_thread_id, ctx.chat?.id);
+      if (!routed) return ctx.reply('Topic này chưa được map với cuộc trò chuyện Zalo nào.');
+      await routed.bridge.handleTelegramUndo(ctx, routed.mapping);
+    });
+
+    this.bot.command('react', async (ctx) => {
+      if (!ctx.message?.message_thread_id || !ctx.message?.reply_to_message) {
+        return ctx.reply('Reply vào một tin nhắn trong topic Zalo rồi gõ /react ❤️ (hoặc 👍 😂 😮 😢 😡 / off). Bạn cũng có thể bấm thả cảm xúc trực tiếp vào tin nhắn.');
+      }
+      const routed = this.findBridgeByTopic(ctx.message.message_thread_id, ctx.chat?.id);
+      if (!routed) return ctx.reply('Topic này chưa được map với cuộc trò chuyện Zalo nào.');
+      const arg = ctx.message.text.replace(/^\/react(?:@\w+)?\s*/i, '').trim();
+      await routed.bridge.handleTelegramReaction(
+        ctx,
+        arg || '❤️',
+        ctx.message.reply_to_message.message_id,
+        routed.mapping,
+        { replyOnSuccess: true },
+      );
+    });
+
+    this.bot.on('message_reaction', async (ctx) => {
+      const reactionUpdate = ctx.update?.message_reaction;
+      if (!reactionUpdate) return;
+      const chatId = reactionUpdate.chat?.id;
+      const messageId = reactionUpdate.message_id;
+      const userId = reactionUpdate.user?.id || ctx.from?.id;
+      for (const bridge of this.bridges) {
+        if (Number(bridge.config.telegramForumChatId) !== Number(chatId)) continue;
+        if (!isAllowed(bridge.config, userId)) continue;
+        const entry = bridge.store.findMessageByTelegramId?.(null, messageId);
+        if (!entry) continue;
+        const mapping = (entry.topicId && bridge.store.getByTopic?.(entry.topicId)) ||
+          Object.values(bridge.store.state?.conversations || {}).find((c) => Number(c.topicId) === Number(entry.topicId));
+        if (!mapping) continue;
+        const latest = Array.isArray(reactionUpdate.new_reaction) ? reactionUpdate.new_reaction.at(-1) : null;
+        const emoji = latest?.emoji || '';
+        await bridge.handleTelegramReaction(ctx, emoji, messageId, mapping, { replyOnSuccess: false });
+        return;
+      }
+    });
+
     this.bot.on(message('text'), async (ctx) => {
       if (ctx.message.text.startsWith('/')) {
         if (ctx.chat?.type === 'private') await ctx.reply('Lệnh chưa được hỗ trợ trong phiên bản đang chạy. Dùng /menu hoặc /ping.');
@@ -1015,6 +1144,22 @@ class SharedTelegramRuntime {
 
     this.bot.on(message('document'), async (ctx) => {
       await this.routeTelegramMessage(ctx, 'document');
+    });
+
+    this.bot.on(message('voice'), async (ctx) => {
+      await this.routeTelegramMessage(ctx, 'voice');
+    });
+
+    this.bot.on(message('audio'), async (ctx) => {
+      await this.routeTelegramMessage(ctx, 'audio');
+    });
+
+    this.bot.on(message('video'), async (ctx) => {
+      await this.routeTelegramMessage(ctx, 'video');
+    });
+
+    this.bot.on(message('video_note'), async (ctx) => {
+      await this.routeTelegramMessage(ctx, 'video_note');
     });
 
     this.bot.catch(async (error, ctx) => {
@@ -1076,6 +1221,10 @@ class SharedTelegramRuntime {
         await routed.bridge.forwardTelegramText(ctx, routed.mapping);
       } else if (type === 'photo') {
         await routed.bridge.forwardTelegramPhoto(ctx, routed.mapping);
+      } else if (type === 'voice' || type === 'audio') {
+        await routed.bridge.forwardTelegramVoice(ctx, routed.mapping);
+      } else if (type === 'video' || type === 'video_note') {
+        await routed.bridge.forwardTelegramVideo(ctx, routed.mapping);
       } else {
         await routed.bridge.forwardTelegramDocument(ctx, routed.mapping);
       }
@@ -1328,11 +1477,29 @@ export class TelegramBridgeBot {
         Input.fromBuffer(file.buffer, file.filename),
         { ...options, caption },
       ));
-      const method = file.kind === 'photo' ? 'sendPhoto' : file.kind === 'video' ? 'sendVideo' : 'sendDocument';
+      const method =
+        file.kind === 'photo'
+          ? 'sendPhoto'
+          : file.kind === 'video'
+            ? 'sendVideo'
+            : file.kind === 'voice'
+              ? 'sendVoice'
+              : file.kind === 'audio'
+                ? 'sendAudio'
+                : 'sendDocument';
       try {
         return await upload(method);
       } catch (error) {
         if (passThrough(error)) throw error;
+        if (method === 'sendVoice' && Number(error?.response?.error_code) === 400 && typeof this.bot.telegram.sendAudio === 'function') {
+          this.logger.warn({ error: humanError(error) }, 'Telegram rejected sendVoice; retrying as audio.');
+          try {
+            return await upload('sendAudio');
+          } catch (audioError) {
+            if (passThrough(audioError)) throw audioError;
+            error = audioError;
+          }
+        }
         if (method !== 'sendDocument' && Number(error?.response?.error_code) === 400) {
           // e.g. PHOTO_INVALID_DIMENSIONS / IMAGE_PROCESS_FAILED: still deliver the file.
           this.logger.warn({ error: humanError(error) }, `Telegram rejected ${method}; retrying as document.`);
@@ -1372,8 +1539,9 @@ export class TelegramBridgeBot {
       : null;
 
     this.pendingEcho?.register?.(mapping.conversationId);
+    let sent;
     try {
-      await this.zalo.sendText({
+      sent = await this.zalo.sendText({
         conversationId: mapping.conversationId,
         threadType: mapping.threadType,
         text: ctx.message.text,
@@ -1384,11 +1552,14 @@ export class TelegramBridgeBot {
       throw error;
     }
     await this.onTranscript?.(mapping, {
+      ...(sent?.msgId ? { id: String(sent.msgId) } : {}),
       direction: 'out',
       source: 'telegram',
       senderName: telegramSenderName(ctx),
       text: ctx.message.text,
       attachment: null,
+      telegramMessageId: ctx.message?.message_id,
+      replyData: sent?.msgId ? { msgId: String(sent.msgId), ...(sent.cliMsgId ? { cliMsgId: String(sent.cliMsgId) } : {}) } : null,
       threadType: mapping.threadType,
     });
   }
@@ -1423,8 +1594,9 @@ export class TelegramBridgeBot {
     );
 
     this.pendingEcho?.register?.(mapping.conversationId);
+    let sent;
     try {
-      await this.zalo.sendImage({
+      sent = await this.zalo.sendImage({
         conversationId: mapping.conversationId,
         threadType: mapping.threadType,
         filePath: targetPath,
@@ -1447,6 +1619,7 @@ export class TelegramBridgeBot {
       await this.cleanupTelegramFile(targetPath);
     }
     await this.onTranscript?.(mapping, {
+      ...(sent?.msgId ? { id: String(sent.msgId) } : {}),
       direction: 'out',
       source: 'telegram',
       senderName: telegramSenderName(ctx),
@@ -1454,6 +1627,8 @@ export class TelegramBridgeBot {
       attachment: {
         title: 'image',
       },
+      telegramMessageId: ctx.message?.message_id,
+      replyData: sent?.msgId ? { msgId: String(sent.msgId), ...(sent.cliMsgId ? { cliMsgId: String(sent.cliMsgId) } : {}) } : null,
       threadType: mapping.threadType,
     });
   }
@@ -1496,9 +1671,10 @@ export class TelegramBridgeBot {
     );
 
     this.pendingEcho?.register?.(mapping.conversationId);
+    let sent;
     try {
       const send = isImage ? this.zalo.sendImage.bind(this.zalo) : this.zalo.sendFile.bind(this.zalo);
-      await send({
+      sent = await send({
         conversationId: mapping.conversationId,
         threadType: mapping.threadType,
         filePath: targetPath,
@@ -1521,6 +1697,7 @@ export class TelegramBridgeBot {
       await this.cleanupTelegramFile(targetPath);
     }
     await this.onTranscript?.(mapping, {
+      ...(sent?.msgId ? { id: String(sent.msgId) } : {}),
       direction: 'out',
       source: 'telegram',
       senderName: telegramSenderName(ctx),
@@ -1529,8 +1706,273 @@ export class TelegramBridgeBot {
         title: filename,
         type: isImage ? 'image' : 'file',
       },
+      telegramMessageId: ctx.message?.message_id,
+      replyData: sent?.msgId ? { msgId: String(sent.msgId), ...(sent.cliMsgId ? { cliMsgId: String(sent.cliMsgId) } : {}) } : null,
       threadType: mapping.threadType,
     });
+  }
+
+  async forwardTelegramVoice(ctx, mapped = null) {
+    if (ctx.chat?.id !== this.config.telegramForumChatId) return;
+    if (!ctx.message.message_thread_id) {
+      await ctx.reply('Ghi âm này chưa nằm trong topic Zalo nào nên không biết gửi về đâu.');
+      return;
+    }
+    if (!isAllowed(this.config, ctx.from.id)) {
+      await ctx.reply(
+        'Bạn chưa được cấp quyền gửi sang Zalo. Telegram user ID của bạn là ' + ctx.from?.id + '. Thêm ID này vào ALLOWED_TELEGRAM_USER_IDS trong biến môi trường của service bridge (Koyeb/Render) rồi redeploy.',
+      );
+      return;
+    }
+    const mapping = mapped || this.store.getByTopic(ctx.message.message_thread_id);
+    if (!mapping) {
+      await ctx.reply('Topic này chưa được map với cuộc trò chuyện Zalo nào.');
+      return;
+    }
+    const quote = ctx.message.reply_to_message
+      ? this.store.getReplyData(ctx.message.reply_to_message.message_id)
+      : null;
+
+    const media = ctx.message.voice || ctx.message.audio;
+    const isVoiceNote = Boolean(ctx.message.voice);
+    const ext = media.file_name?.split('.').at(-1) || (isVoiceNote ? 'm4a' : 'mp3');
+    const filename = media.file_name || `voice-${media.file_unique_id}.${ext}`;
+    const targetPath = await this.downloadTelegramFile(ctx, media.file_id, media.file_unique_id, ext, media.file_size);
+
+    this.pendingEcho?.register?.(mapping.conversationId);
+    let sent;
+    try {
+      const send = typeof this.zalo.sendVoice === 'function' ? this.zalo.sendVoice.bind(this.zalo) : this.zalo.sendFile.bind(this.zalo);
+      sent = await send({
+        conversationId: mapping.conversationId,
+        threadType: mapping.threadType,
+        filePath: targetPath,
+        filename,
+        caption: ctx.message.caption,
+        quote,
+      });
+    } catch (error) {
+      this.pendingEcho?.consume?.(mapping.conversationId);
+      throw error;
+    } finally {
+      await this.cleanupTelegramFile(targetPath);
+    }
+    await this.onTranscript?.(mapping, {
+      ...(sent?.msgId ? { id: String(sent.msgId) } : {}),
+      direction: 'out',
+      source: 'telegram',
+      senderName: telegramSenderName(ctx),
+      text: ctx.message.caption || '',
+      attachment: { title: filename, type: 'voice' },
+      telegramMessageId: ctx.message?.message_id,
+      replyData: sent?.msgId ? { msgId: String(sent.msgId), ...(sent.cliMsgId ? { cliMsgId: String(sent.cliMsgId) } : {}) } : null,
+      threadType: mapping.threadType,
+    });
+  }
+
+  async forwardTelegramVideo(ctx, mapped = null) {
+    if (ctx.chat?.id !== this.config.telegramForumChatId) return;
+    if (!ctx.message.message_thread_id) {
+      await ctx.reply('Video này chưa nằm trong topic Zalo nào nên không biết gửi về đâu.');
+      return;
+    }
+    if (!isAllowed(this.config, ctx.from.id)) {
+      await ctx.reply(
+        'Bạn chưa được cấp quyền gửi sang Zalo. Telegram user ID của bạn là ' + ctx.from?.id + '. Thêm ID này vào ALLOWED_TELEGRAM_USER_IDS trong biến môi trường của service bridge (Koyeb/Render) rồi redeploy.',
+      );
+      return;
+    }
+    const mapping = mapped || this.store.getByTopic(ctx.message.message_thread_id);
+    if (!mapping) {
+      await ctx.reply('Topic này chưa được map với cuộc trò chuyện Zalo nào.');
+      return;
+    }
+    const quote = ctx.message.reply_to_message
+      ? this.store.getReplyData(ctx.message.reply_to_message.message_id)
+      : null;
+
+    const media = ctx.message.video || ctx.message.video_note;
+    const filename = media.file_name || `video-${media.file_unique_id}.mp4`;
+    const targetPath = await this.downloadTelegramFile(ctx, media.file_id, media.file_unique_id, 'mp4', media.file_size);
+    let thumbPath = null;
+    const thumb = media.thumbnail || media.thumb;
+    if (thumb?.file_id) {
+      try {
+        thumbPath = await this.downloadTelegramFile(ctx, thumb.file_id, `${media.file_unique_id}-thumb`, 'jpg', thumb.file_size);
+      } catch {
+        thumbPath = null;
+      }
+    }
+
+    this.pendingEcho?.register?.(mapping.conversationId);
+    let sent;
+    try {
+      const send = typeof this.zalo.sendVideo === 'function' ? this.zalo.sendVideo.bind(this.zalo) : this.zalo.sendFile.bind(this.zalo);
+      sent = await send({
+        conversationId: mapping.conversationId,
+        threadType: mapping.threadType,
+        filePath: targetPath,
+        filename,
+        thumbnailPath: thumbPath,
+        duration: media.duration || 0,
+        width: media.width || media.length || 1280,
+        height: media.height || media.length || 720,
+        caption: ctx.message.caption,
+        quote,
+      });
+    } catch (error) {
+      this.pendingEcho?.consume?.(mapping.conversationId);
+      throw error;
+    } finally {
+      await this.cleanupTelegramFile(targetPath);
+      await this.cleanupTelegramFile(thumbPath);
+    }
+    await this.onTranscript?.(mapping, {
+      ...(sent?.msgId ? { id: String(sent.msgId) } : {}),
+      direction: 'out',
+      source: 'telegram',
+      senderName: telegramSenderName(ctx),
+      text: ctx.message.caption || '',
+      attachment: { title: filename, type: 'video' },
+      telegramMessageId: ctx.message?.message_id,
+      replyData: sent?.msgId ? { msgId: String(sent.msgId), ...(sent.cliMsgId ? { cliMsgId: String(sent.cliMsgId) } : {}) } : null,
+      threadType: mapping.threadType,
+    });
+  }
+
+  async handleTelegramUndo(ctx, mapped = null) {
+    if (!isAllowed(this.config, ctx.from?.id)) {
+      return ctx.reply('Bạn chưa được cấp quyền thao tác với Zalo.');
+    }
+    const mapping = mapped || this.store.getByTopic?.(ctx.message?.message_thread_id);
+    if (!mapping) return ctx.reply('Topic này chưa được map với cuộc trò chuyện Zalo nào.');
+
+    const replyId = ctx.message?.reply_to_message?.message_id;
+    const entry = replyId
+      ? this.store.findMessageByTelegramId?.(mapping.conversationId, replyId)
+      : this.store.findLastOutgoingMessage?.(mapping.conversationId);
+
+    if (!entry) {
+      return ctx.reply(replyId
+        ? 'Không tìm thấy mã tin nhắn Zalo của tin được reply để thu hồi.'
+        : 'Không tìm thấy tin nhắn nào vừa gửi sang Zalo trong topic này để thu hồi.');
+    }
+    if (entry.direction !== 'out') {
+      return ctx.reply('Chỉ thu hồi được tin nhắn do phía bạn gửi đi.');
+    }
+    const msgId = entry.replyData?.msgId ?? (entry.id && !String(entry.id).includes('-') ? entry.id : null);
+    const cliMsgId = entry.replyData?.cliMsgId ?? msgId;
+    if (!msgId) {
+      return ctx.reply('Chưa nhận được msgId từ Zalo cho tin nhắn này nên chưa thu hồi được.');
+    }
+
+    try {
+      await this.zalo.undoMessage({
+        conversationId: mapping.conversationId,
+        threadType: mapping.threadType,
+        msgId,
+        cliMsgId,
+      });
+      await this.store.markMessageRecalled?.(mapping.conversationId, entry);
+      if (entry.telegramMessageId) {
+        await this.bot.telegram.deleteMessage(this.config.telegramForumChatId, entry.telegramMessageId).catch(() => {});
+      }
+      await ctx.reply('🗑 Đã thu hồi tin nhắn trên Zalo.');
+    } catch (error) {
+      await ctx.reply(`Không thu hồi được tin nhắn trên Zalo.\n${humanError(error)}`);
+    }
+  }
+
+  async handleTelegramReaction(ctx, emojiOrInput, targetTelegramMessageId, mapped = null, { replyOnSuccess = false } = {}) {
+    const userId = ctx.from?.id || ctx.update?.message_reaction?.user?.id;
+    if (!isAllowed(this.config, userId)) return;
+    const entry = this.store.findMessageByTelegramId?.(mapped?.conversationId || null, targetTelegramMessageId);
+    if (!entry) {
+      if (replyOnSuccess) await ctx.reply('Không tìm thấy tin nhắn Zalo tương ứng để thả cảm xúc.');
+      return;
+    }
+    const mapping = mapped || (entry.topicId && this.store.getByTopic?.(entry.topicId));
+    if (!mapping) return;
+    const msgId = entry.replyData?.msgId ?? (entry.id && !String(entry.id).includes('-') ? entry.id : null);
+    const cliMsgId = entry.replyData?.cliMsgId ?? msgId;
+    if (!msgId) {
+      if (replyOnSuccess) await ctx.reply('Tin nhắn này chưa có msgId Zalo để thả cảm xúc.');
+      return;
+    }
+    const reaction = telegramReactionToZalo(emojiOrInput);
+    try {
+      this.pendingReactionEchoes ||= new Map();
+      this.pendingReactionEchoes.set(`${mapping.conversationId}:${msgId}`, Date.now() + 10000);
+      await this.zalo.sendReaction({
+        conversationId: mapping.conversationId,
+        threadType: mapping.threadType,
+        msgId,
+        cliMsgId,
+        reaction,
+      });
+      if (replyOnSuccess) {
+        const tgEmoji = zaloReactionToTelegram(reaction);
+        if (entry.telegramMessageId) {
+          await this.bot.telegram.callApi('setMessageReaction', {
+            chat_id: this.config.telegramForumChatId,
+            message_id: entry.telegramMessageId,
+            reaction: tgEmoji ? [{ type: 'emoji', emoji: tgEmoji }] : [],
+          }).catch(() => {});
+        }
+      }
+    } catch (error) {
+      this.logger.warn({ error, msgId }, 'Could not send reaction to Zalo.');
+      if (replyOnSuccess) await ctx.reply(`Không thả được cảm xúc sang Zalo.\n${humanError(error)}`);
+    }
+  }
+
+  async handleZaloUndo(undoEvent) {
+    if (!undoEvent?.conversationId) return;
+    const mapping = this.store.getByConversation?.(undoEvent.conversationId);
+    if (!mapping) return;
+    const entry = this.store.findMessageByZaloId?.(undoEvent.conversationId, {
+      msgId: undoEvent.msgId,
+      cliMsgId: undoEvent.cliMsgId,
+    });
+    if (entry?.recalledAt) return;
+    if (entry) await this.store.markMessageRecalled?.(undoEvent.conversationId, entry);
+    const chatId = this.config.telegramForumChatId;
+    const send = (action) => this.runtime.groupQueue.run(chatId, action, this.forwardingAbort.signal, { retryAmbiguous: true });
+    const who = undoEvent.isSelf ? 'Tôi' : (undoEvent.senderName || mapping.title || 'Zalo');
+    const text = entry
+      ? `🗑 [${who}] đã thu hồi tin nhắn này trên Zalo.`
+      : `🗑 [${who}] đã thu hồi một tin nhắn trên Zalo.`;
+    await send(() => this.bot.telegram.sendMessage(chatId, text, {
+      message_thread_id: mapping.topicId,
+      ...(entry?.telegramMessageId ? { reply_to_message_id: entry.telegramMessageId } : {}),
+    }));
+  }
+
+  async handleZaloReaction(reactionEvent) {
+    if (!reactionEvent?.conversationId) return;
+    const mapping = this.store.getByConversation?.(reactionEvent.conversationId);
+    if (!mapping) return;
+    const emoji = zaloReactionToTelegram(reactionEvent.rIcon);
+    const chatId = this.config.telegramForumChatId;
+    const send = (action) => this.runtime.groupQueue.run(chatId, action, this.forwardingAbort.signal);
+
+    for (const target of reactionEvent.targets || []) {
+      const entry = this.store.findMessageByZaloId?.(reactionEvent.conversationId, target);
+      if (!entry?.telegramMessageId) continue;
+      const echoKey = `${reactionEvent.conversationId}:${entry.replyData?.msgId ?? entry.id}`;
+      const echoExpiry = this.pendingReactionEchoes?.get(echoKey) || 0;
+      if (reactionEvent.isSelf && echoExpiry >= Date.now()) {
+        this.pendingReactionEchoes.delete(echoKey);
+        continue;
+      }
+      await send(() => this.bot.telegram.callApi('setMessageReaction', {
+        chat_id: chatId,
+        message_id: entry.telegramMessageId,
+        reaction: emoji ? [{ type: 'emoji', emoji }] : [],
+      })).catch((error) => {
+        this.logger.warn({ error: humanError(error), messageId: entry.telegramMessageId }, 'Could not set Telegram message reaction.');
+      });
+    }
   }
 
   async downloadTelegramFile(ctx, fileId, uniqueId, fallbackExtension, fileSize) {

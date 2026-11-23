@@ -192,6 +192,13 @@ export class BridgeController extends EventEmitter {
       this.zalo.onMessage(async (message) => {
         const explicitAiRequest = /^\/(?:ask|ai)(?:@\w+)?(?:\s|$)/i.test(String(message.text || '').trim());
         if (message.isSelf && this.consumePendingEcho(message.conversationId, message.text, explicitAiRequest)) {
+          const data = message.raw?.data;
+          const replyData = data && (data.msgId || data.cliMsgId)
+            ? Object.fromEntries(['content', 'msgType', 'propertyExt', 'uidFrom', 'msgId', 'cliMsgId', 'ts', 'ttl']
+                .filter((key) => data[key] !== undefined)
+                .map((key) => [key, data[key]]))
+            : null;
+          await this.store.attachZaloEcho?.(message.conversationId, replyData, message.id);
           return;
         }
 
@@ -205,6 +212,24 @@ export class BridgeController extends EventEmitter {
           if (result.status === 'rejected') this.logger.error({ error: result.reason }, 'Could not process incoming Zalo message.');
         }
         await this.relayToLocalIngest(message);
+      });
+
+      this.zalo.on('undo', async (undoEvent) => {
+        this.lastActivityAt = Date.now();
+        try {
+          await this.telegram?.handleZaloUndo?.(undoEvent);
+        } catch (error) {
+          this.logger.warn({ error, conversationId: undoEvent?.conversationId }, 'Could not forward Zalo undo to Telegram.');
+        }
+      });
+
+      this.zalo.on('reaction', async (reactionEvent) => {
+        this.lastActivityAt = Date.now();
+        try {
+          await this.telegram?.handleZaloReaction?.(reactionEvent);
+        } catch (error) {
+          this.logger.warn({ error, conversationId: reactionEvent?.conversationId }, 'Could not forward Zalo reaction to Telegram.');
+        }
       });
 
       await this.telegram.start();

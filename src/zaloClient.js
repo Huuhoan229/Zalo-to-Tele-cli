@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
-import { LoginQRCallbackEventType, Zalo, ThreadType } from 'zca-js';
+import { LoginQRCallbackEventType, Zalo, ThreadType, Reactions } from 'zca-js';
 import { imageMetadataGetter, safeFilename } from './media.js';
 
 function sleep(ms) {
@@ -70,16 +70,23 @@ function parseObject(value) {
 
 function normalizeAttachment(content, messageType = '') {
   const value = parseObject(content);
-  if (!value && !/sticker/i.test(String(messageType))) return null;
+  const typeText = String(messageType || '');
+  if (!value && !/sticker/i.test(typeText)) return null;
   const params = parseObject(value?.params);
   const sticker = value?.sticker || value?.stickerInfo ||
     (String(value?.type || '').toLowerCase() === 'sticker' ? value : null) ||
-    (/sticker/i.test(String(messageType)) ? params?.sticker || params || value || {} : null);
+    (/sticker/i.test(typeText) ? params?.sticker || params || value || {} : null);
   const href =
     value?.href ||
-    value?.thumb ||
-    value?.previewUrl ||
+    value?.hdUrl ||
+    value?.normalUrl ||
+    value?.videoUrl ||
+    value?.voiceUrl ||
+    value?.m4aUrl ||
+    value?.fileUrl ||
     value?.url ||
+    value?.previewUrl ||
+    value?.thumb ||
     sticker?.url ||
     sticker?.href ||
     sticker?.staticUrl ||
@@ -87,14 +94,28 @@ function normalizeAttachment(content, messageType = '') {
     sticker?.stickerUrl ||
     sticker?.stickerWebpUrl;
   const stickerId = sticker?.stickerId || sticker?.sticker_id || sticker?.id || value?.stickerId || value?.sticker_id;
-  const isSticker = Boolean(sticker || /sticker/i.test(String(messageType)));
+  const isSticker = Boolean(sticker || /sticker/i.test(typeText));
   if (!href && !stickerId && !isSticker) return null;
+  let type = 'file';
+  if (isSticker) type = 'sticker';
+  else if (/voice/i.test(typeText) || value?.voiceUrl || value?.m4aUrl) type = 'voice';
+  else if (/video/i.test(typeText) || value?.videoUrl) type = 'video';
+  else if (/photo|image/i.test(typeText)) type = 'image';
   return {
     url: href || null,
     stickerId: stickerId ? Number(stickerId) || String(stickerId) : null,
-    title: isSticker ? 'sticker' : value?.title || value?.fileName || 'attachment',
-    type: isSticker ? 'sticker' : 'file',
+    title: isSticker ? 'sticker' : value?.title || value?.fileName || (type === 'voice' ? 'voice.m4a' : type === 'video' ? 'video.mp4' : 'attachment'),
+    type,
     raw: value || content,
+  };
+}
+
+function extractSentIds(response) {
+  const msgId = response?.message?.msgId ?? response?.attachment?.[0]?.msgId ?? response?.msgId ?? null;
+  const cliMsgId = response?.message?.cliMsgId ?? response?.attachment?.[0]?.cliMsgId ?? response?.cliMsgId ?? null;
+  return {
+    msgId: msgId !== null && msgId !== undefined ? String(msgId) : null,
+    cliMsgId: cliMsgId !== null && cliMsgId !== undefined ? String(cliMsgId) : null,
   };
 }
 
@@ -296,7 +317,73 @@ export class ZaloClient extends EventEmitter {
       }
     });
 
+    this.api.listener.on('undo', async (undo) => {
+      try {
+        this.emit('undo', this.normalizeUndo(undo));
+      } catch (error) {
+        this.logger.error({ error, undo }, 'Failed to handle Zalo undo event');
+      }
+    });
+
+    this.api.listener.on('reaction', async (reaction) => {
+      try {
+        this.emit('reaction', this.normalizeReaction(reaction));
+      } catch (error) {
+        this.logger.error({ error, reaction }, 'Failed to handle Zalo reaction event');
+      }
+    });
+
     this.api.listener.start({ retryOnClose: false });
+  }
+
+  normalizeUndo(undo) {
+    const data = undo?.data || {};
+    const content = parseObject(data.content) || {};
+    const isSelf = Boolean(
+      undo?.isSelf ||
+      (this.selfUserId && String(data.uidFrom || '') === this.selfUserId),
+    );
+    const msgId = content.globalMsgId ?? data.realMsgId ?? data.msgId ?? null;
+    const cliMsgId = content.cliMsgId ?? data.cliMsgId ?? null;
+    return {
+      conversationId: String(undo?.threadId || data.idTo || data.uidFrom || ''),
+      threadType: undo?.isGroup ? ThreadType.Group : ThreadType.User,
+      isGroup: Boolean(undo?.isGroup),
+      isSelf,
+      senderName: isSelf ? 'Tôi' : (data.dName || data.uidFrom || 'Zalo'),
+      msgId: msgId !== null && msgId !== undefined ? String(msgId) : null,
+      cliMsgId: cliMsgId !== null && cliMsgId !== undefined ? String(cliMsgId) : null,
+      raw: undo,
+    };
+  }
+
+  normalizeReaction(reaction) {
+    const data = reaction?.data || {};
+    const content = parseObject(data.content) || {};
+    const isSelf = Boolean(
+      reaction?.isSelf ||
+      (this.selfUserId && String(data.uidFrom || '') === this.selfUserId),
+    );
+    const targets = Array.isArray(content.rMsg) && content.rMsg.length > 0
+      ? content.rMsg.map((item) => ({
+          msgId: item?.gMsgID !== undefined && item?.gMsgID !== null ? String(item.gMsgID) : null,
+          cliMsgId: item?.cMsgID !== undefined && item?.cMsgID !== null ? String(item.cMsgID) : null,
+        }))
+      : [{
+          msgId: data.msgId !== undefined && data.msgId !== null ? String(data.msgId) : null,
+          cliMsgId: data.cliMsgId !== undefined && data.cliMsgId !== null ? String(data.cliMsgId) : null,
+        }];
+    return {
+      conversationId: String(reaction?.threadId || data.idTo || data.uidFrom || ''),
+      threadType: reaction?.isGroup ? ThreadType.Group : ThreadType.User,
+      isGroup: Boolean(reaction?.isGroup),
+      isSelf,
+      senderName: isSelf ? 'Tôi' : (data.dName || data.uidFrom || 'Zalo'),
+      rIcon: typeof content.rIcon === 'string' ? content.rIcon : '',
+      rType: content.rType,
+      targets,
+      raw: reaction,
+    };
   }
 
   stop() {
@@ -378,7 +465,8 @@ export class ZaloClient extends EventEmitter {
 
   async sendText({ conversationId, threadType, text, quote = null }) {
     if (!this.api) throw new Error('Zalo is not connected');
-    await this.api.sendMessage({ msg: text, ...(quote ? { quote } : {}) }, conversationId, threadType);
+    const response = await this.api.sendMessage({ msg: text, ...(quote ? { quote } : {}) }, conversationId, threadType);
+    return extractSentIds(response);
   }
 
   async sendImage({ conversationId, threadType, filePath, caption, quote = null }) {
@@ -388,13 +476,14 @@ export class ZaloClient extends EventEmitter {
       attachments: [path.resolve(filePath)],
       ...(quote ? { quote } : {}),
     };
-    await this.api.sendMessage(payload, conversationId, threadType);
+    const response = await this.api.sendMessage(payload, conversationId, threadType);
+    return extractSentIds(response);
   }
 
   async sendFile({ conversationId, threadType, filePath, filename, caption, quote = null }) {
     if (!this.api) throw new Error('Zalo is not connected');
     const data = await fs.readFile(filePath);
-    await this.api.sendMessage({
+    const response = await this.api.sendMessage({
       msg: caption || '',
       attachments: [{
         data,
@@ -403,5 +492,105 @@ export class ZaloClient extends EventEmitter {
       }],
       ...(quote ? { quote } : {}),
     }, conversationId, threadType);
+    return extractSentIds(response);
+  }
+
+  async sendVoice({ conversationId, threadType, filePath, filename, caption, quote = null }) {
+    if (!this.api) throw new Error('Zalo is not connected');
+    const data = await fs.readFile(filePath);
+    const cleanName = safeFilename(filename || 'voice.m4a', path.basename(filePath));
+    if (typeof this.api.uploadAttachment === 'function' && typeof this.api.sendVoice === 'function') {
+      try {
+        const uploaded = await this.api.uploadAttachment([{
+          data,
+          filename: cleanName,
+          metadata: { totalSize: data.length },
+        }], conversationId, threadType);
+        const voiceUrl = uploaded?.[0]?.fileUrl || uploaded?.[0]?.normalUrl || uploaded?.[0]?.hdUrl;
+        if (voiceUrl) {
+          const response = await this.api.sendVoice({ voiceUrl }, conversationId, threadType);
+          if (caption) {
+            await this.api.sendMessage({ msg: caption, ...(quote ? { quote } : {}) }, conversationId, threadType);
+          }
+          return extractSentIds(response);
+        }
+      } catch (error) {
+        this.logger?.warn?.({ error }, 'Could not send native Zalo voice; falling back to file attachment.');
+      }
+    }
+    return this.sendFile({ conversationId, threadType, filePath, filename: cleanName, caption, quote });
+  }
+
+  async sendVideo({
+    conversationId,
+    threadType,
+    filePath,
+    filename,
+    thumbnailPath = null,
+    duration = 0,
+    width = 1280,
+    height = 720,
+    caption,
+    quote = null,
+  }) {
+    if (!this.api) throw new Error('Zalo is not connected');
+    const data = await fs.readFile(filePath);
+    const rawName = safeFilename(filename || 'video.mp4', path.basename(filePath));
+    const videoFilename = /\.mp4$/i.test(rawName) ? rawName : `${rawName.replace(/\.[a-z0-9]{1,8}$/i, '') || 'video'}.mp4`;
+    if (typeof this.api.uploadAttachment === 'function' && typeof this.api.sendVideo === 'function') {
+      try {
+        const uploaded = await this.api.uploadAttachment([{
+          data,
+          filename: videoFilename,
+          metadata: { totalSize: data.length },
+        }], conversationId, threadType);
+        const videoUrl = uploaded?.[0]?.fileUrl;
+        if (videoUrl) {
+          let thumbnailUrl = videoUrl;
+          if (thumbnailPath) {
+            try {
+              const thumbUploaded = await this.api.uploadAttachment([path.resolve(thumbnailPath)], conversationId, threadType);
+              thumbnailUrl = thumbUploaded?.[0]?.thumbUrl || thumbUploaded?.[0]?.normalUrl || thumbUploaded?.[0]?.hdUrl || videoUrl;
+            } catch (thumbError) {
+              this.logger?.debug?.({ error: thumbError }, 'Could not upload Zalo video thumbnail; using fallback.');
+            }
+          }
+          const response = await this.api.sendVideo({
+            videoUrl,
+            thumbnailUrl,
+            msg: caption || '',
+            duration: Math.round((Number(duration) || 0) * 1000),
+            width: Number(width) || 1280,
+            height: Number(height) || 720,
+          }, conversationId, threadType);
+          return extractSentIds(response);
+        }
+      } catch (error) {
+        this.logger?.warn?.({ error }, 'Could not send native Zalo video bubble; falling back to file attachment.');
+      }
+    }
+    return this.sendFile({ conversationId, threadType, filePath, filename: videoFilename, caption, quote });
+  }
+
+  async undoMessage({ conversationId, threadType, msgId, cliMsgId = 0 }) {
+    if (!this.api) throw new Error('Zalo is not connected');
+    if (!msgId) throw new Error('Không tìm thấy msgId Zalo của tin nhắn này để thu hồi.');
+    return this.api.undo({
+      msgId: String(msgId),
+      cliMsgId: String(cliMsgId ?? msgId),
+    }, String(conversationId), threadType ?? ThreadType.User);
+  }
+
+  async sendReaction({ conversationId, threadType, msgId, cliMsgId = 0, reaction = Reactions.HEART }) {
+    if (!this.api) throw new Error('Zalo is not connected');
+    if (!msgId) throw new Error('Không tìm thấy msgId Zalo của tin nhắn này để thả cảm xúc.');
+    return this.api.addReaction(reaction, {
+      data: {
+        msgId: String(msgId),
+        cliMsgId: String(cliMsgId ?? msgId),
+      },
+      threadId: String(conversationId),
+      type: threadType ?? ThreadType.User,
+    });
   }
 }

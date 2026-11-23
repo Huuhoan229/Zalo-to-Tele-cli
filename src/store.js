@@ -486,6 +486,85 @@ export class Store {
     return null;
   }
 
+  findMessageByTelegramId(conversationId, telegramMessageId) {
+    const target = String(telegramMessageId ?? '');
+    if (!target) return null;
+    const buckets = conversationId && this.state.messages[String(conversationId)]
+      ? [this.state.messages[String(conversationId)], ...Object.values(this.state.messages)]
+      : Object.values(this.state.messages);
+    for (const items of buckets) {
+      for (let index = items.length - 1; index >= 0; index -= 1) {
+        const item = items[index];
+        if (String(item.telegramMessageId ?? '') === target) return item;
+      }
+    }
+    return null;
+  }
+
+  findMessageByZaloId(conversationId, { msgId, cliMsgId } = {}) {
+    const targetMsgId = msgId !== null && msgId !== undefined && String(msgId) !== '' ? String(msgId) : null;
+    const targetCliId = cliMsgId !== null && cliMsgId !== undefined && String(cliMsgId) !== '' && String(cliMsgId) !== '0'
+      ? String(cliMsgId)
+      : null;
+    if (!targetMsgId && !targetCliId) return null;
+    const items = this.state.messages[String(conversationId)] || [];
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = items[index];
+      const itemMsgId = String(item.replyData?.msgId ?? item.id ?? '');
+      const itemCliId = String(item.replyData?.cliMsgId ?? '');
+      if (targetMsgId && itemMsgId && itemMsgId === targetMsgId) return item;
+      if (targetCliId && ((itemCliId && itemCliId === targetCliId) || (itemMsgId && itemMsgId === targetCliId))) return item;
+    }
+    return null;
+  }
+
+  findLastOutgoingMessage(conversationId) {
+    const items = this.state.messages[String(conversationId)] || [];
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = items[index];
+      if (item.direction === 'out' && !item.recalledAt && (item.replyData?.msgId || item.id)) {
+        return item;
+      }
+    }
+    return null;
+  }
+
+  async attachZaloEcho(conversationId, replyData, fallbackMsgId = null) {
+    if (!replyData && !fallbackMsgId) return null;
+    const items = this.state.messages[String(conversationId)] || [];
+    const incomingMsgId = String(replyData?.msgId ?? fallbackMsgId ?? '');
+    let target = null;
+    if (incomingMsgId) {
+      for (let index = items.length - 1; index >= 0; index -= 1) {
+        const item = items[index];
+        if (item.direction === 'out' && (String(item.id) === incomingMsgId || String(item.replyData?.msgId ?? '') === incomingMsgId)) {
+          target = item;
+          break;
+        }
+      }
+    }
+    if (!target) {
+      for (let index = items.length - 1; index >= 0; index -= 1) {
+        const item = items[index];
+        if (item.direction === 'out' && !item.replyData?.cliMsgId) {
+          target = item;
+          break;
+        }
+      }
+    }
+    if (!target) return null;
+    if (incomingMsgId && (!target.id || target.id.includes('-'))) target.id = incomingMsgId;
+    target.replyData = storedQuoteData({ ...(target.replyData || {}), ...(replyData || {}), ...(incomingMsgId ? { msgId: incomingMsgId } : {}) });
+    await this.save();
+    return target;
+  }
+
+  async markMessageRecalled(conversationId, entry) {
+    if (!entry) return;
+    entry.recalledAt = new Date().toISOString();
+    await this.save();
+  }
+
   async ensureTelegramUpdateClaims() {
     if (!this.useMongo) return null;
     if (this.telegramUpdateClaims) return this.telegramUpdateClaims;
