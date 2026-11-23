@@ -190,6 +190,7 @@ export class Store {
     this.mongoClient = null;
     this.mongoCollection = null;
     this.ocrQueueCollection = null;
+    this.telegramUpdateClaims = null;
   }
 
   async deleteState() {
@@ -483,6 +484,45 @@ export class Store {
       }
     }
     return null;
+  }
+
+  async ensureTelegramUpdateClaims() {
+    if (!this.useMongo) return null;
+    if (this.telegramUpdateClaims) return this.telegramUpdateClaims;
+    await this.ensureMongo();
+    const collection = this.mongoClient.db(this.mongoDbName).collection('telegram_update_claims');
+    await collection.createIndex({ claimedAt: 1 }, { expireAfterSeconds: 3 * 24 * 60 * 60 });
+    this.telegramUpdateClaims = collection;
+    return collection;
+  }
+
+  /**
+   * Durably claims a Telegram update before it is forwarded to Zalo.
+   * Returns false when the update was already claimed (by this or a previous
+   * process/deployment), so a redelivered webhook never re-sends to Zalo.
+   */
+  async claimTelegramUpdate(key) {
+    const id = String(key);
+    if (this.useMongo) {
+      const collection = await this.ensureTelegramUpdateClaims();
+      try {
+        await collection.insertOne({ _id: id, accountId: this.accountId, claimedAt: new Date() });
+        return true;
+      } catch (error) {
+        if (error?.code === 11000) return false;
+        throw error;
+      }
+    }
+    const now = Date.now();
+    const claims = this.state.telegramUpdateClaims || {};
+    for (const [claimId, at] of Object.entries(claims)) {
+      if (now - at > 3 * DAY_MS) delete claims[claimId];
+    }
+    if (claims[id]) return false;
+    claims[id] = now;
+    this.state.telegramUpdateClaims = claims;
+    await this.save();
+    return true;
   }
 
   async enqueueOcrMessage(message) {

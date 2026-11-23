@@ -43,6 +43,61 @@ async function telegramPhotoDataUrl(ctx) {
   return `data:${mime};base64,${buffer.toString('base64')}`;
 }
 
+async function readJsonBody(req, maxBytes = 1024 * 1024) {
+  let size = 0;
+  const chunks = [];
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > maxBytes) throw new Error('Webhook body too large');
+    chunks.push(chunk);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
+
+function updateChatKey(update) {
+  const chat = update?.message?.chat || update?.callback_query?.message?.chat || update?.edited_message?.chat;
+  return chat?.id !== undefined ? String(chat.id) : 'global';
+}
+
+const MAX_ZALO_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'webp']);
+const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'm4v']);
+const MIME_EXTENSIONS = {
+  'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif',
+  'video/mp4': 'mp4', 'application/pdf': 'pdf', 'text/plain': 'txt', 'application/zip': 'zip',
+};
+
+function fileExtension(name) {
+  const match = String(name || '').toLowerCase().match(/\.([a-z0-9]{1,8})$/);
+  return match ? match[1] : '';
+}
+
+function safeFilename(name) {
+  return String(name || '').replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').trim().slice(0, 120);
+}
+
+// Download a Zalo attachment on our server, so Telegram does not have to fetch
+// Zalo's CDN itself (it often fails with "failed to get HTTP URL content").
+export async function downloadZaloAttachment(attachment, { fetchImpl = fetch, timeoutMs = 30000, maxBytes = MAX_ZALO_ATTACHMENT_BYTES } = {}) {
+  const response = await fetchImpl(attachment.url, { signal: AbortSignal.timeout(timeoutMs) });
+  if (!response.ok) throw new Error(`Không tải được tệp Zalo: HTTP ${response.status}`);
+  const declared = Number(response.headers.get('content-length') || 0);
+  if (declared > maxBytes) throw Object.assign(new Error('Tệp Zalo lớn hơn 20 MB'), { tooLarge: true });
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (buffer.length > maxBytes) throw Object.assign(new Error('Tệp Zalo lớn hơn 20 MB'), { tooLarge: true });
+  const mime = String(response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  let filename = safeFilename(attachment.title && attachment.title !== 'attachment' && attachment.title !== 'sticker' ? attachment.title : '');
+  let ext = fileExtension(filename);
+  if (!ext) {
+    ext = MIME_EXTENSIONS[mime] || fileExtension(new URL(attachment.url).pathname) || (mime.startsWith('image/') ? 'jpg' : 'bin');
+    filename = `${filename || (attachment.type === 'sticker' ? 'sticker' : 'zalo-file')}.${ext}`;
+  }
+  let kind = 'document';
+  if (attachment.type === 'sticker' || IMAGE_EXTENSIONS.has(ext) || (mime.startsWith('image/') && mime !== 'image/gif')) kind = 'photo';
+  else if (VIDEO_EXTENSIONS.has(ext) || mime.startsWith('video/')) kind = 'video';
+  return { buffer, filename, kind, mime };
+}
+
 function webhookPathForToken(token) {
   // Derive a secret path from the bot token so random HTTP clients can't
   // fake Telegram updates. 24 hex chars = 96-bit entropy.
@@ -118,6 +173,7 @@ class SharedTelegramRuntime {
     this.startingPromise = null;
     this.processedUpdates = new Map();
     this.inFlightUpdates = new Set();
+    this.updateChains = new Map();
     this.manager = null;
     this.controlStarted = false;
     this.pendingSettings = new Map();
@@ -142,6 +198,8 @@ class SharedTelegramRuntime {
     const webhookBaseUrl = webhookInput ? new URL(webhookInput).origin : '';
     this.webhookBaseUrl = webhookBaseUrl;
     this.webhookPath = webhookBaseUrl ? webhookPathForToken(config.telegramBotToken) : null;
+    // update_id is only unique per bot; scope durable claims to this token.
+    this.updateKeyPrefix = crypto.createHash('sha256').update(String(config.telegramBotToken)).digest('hex').slice(0, 12);
   }
 
   get isWebhookMode() {
@@ -296,10 +354,33 @@ class SharedTelegramRuntime {
         const fullUrl = `${this.webhookBaseUrl}${this.webhookPath}`;
         this.bot.botInfo = await this.bot.telegram.getMe();
         if (generation !== this.generation) return;
-        const callback = this.bot.webhookCallback(this.webhookPath);
-        webhookHandlers.set(this.webhookPath, (req, res) => {
+        const bot = this.bot;
+        webhookHandlers.set(this.webhookPath, async (req, res) => {
           this.lastWebhookRequestAt = new Date().toISOString();
-          return callback(req, res);
+          let update;
+          try {
+            update = await readJsonBody(req);
+          } catch (error) {
+            res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
+            res.end('Bad Request\n');
+            this.logger.warn({ error: humanError(error) }, 'Rejected malformed Telegram webhook body.');
+            return;
+          }
+          // Acknowledge immediately so Telegram never times out and redelivers
+          // the same update while we are still sending it to Zalo.
+          res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+          res.end('ok');
+          // Keep per-chat order (messages to Zalo stay in sequence) without
+          // letting one slow chat block management commands in another chat.
+          const chatKey = updateChatKey(update);
+          const previous = this.updateChains.get(chatKey) || Promise.resolve();
+          const current = previous.then(() => bot.handleUpdate(update)).catch((error) => {
+            this.logger.error({ error, updateId: update?.update_id }, 'Telegram update failed after webhook acknowledgement.');
+          });
+          this.updateChains.set(chatKey, current);
+          current.finally(() => {
+            if (this.updateChains.get(chatKey) === current) this.updateChains.delete(chatKey);
+          });
         });
         await this.bot.telegram.setWebhook(fullUrl, { drop_pending_updates: false, allowed_updates: ['message', 'callback_query'] });
         if (generation !== this.generation) return;
@@ -972,6 +1053,24 @@ class SharedTelegramRuntime {
       this.inFlightUpdates.add(dedupeKey);
     }
 
+    // At-most-once delivery to Zalo: claim the update durably (MongoDB) BEFORE
+    // sending. A webhook redelivered after a restart/redeploy is then skipped
+    // instead of being sent to Zalo again. Sending to Zalo is never retried.
+    if (dedupeKey && typeof routed.bridge.store?.claimTelegramUpdate === 'function') {
+      let claimed = true;
+      try {
+        claimed = await routed.bridge.store.claimTelegramUpdate(`${this.updateKeyPrefix}:${dedupeKey}`);
+      } catch (error) {
+        this.logger.warn({ error: humanError(error), updateId }, 'Could not persist Telegram update claim; using in-memory dedupe only.');
+      }
+      if (!claimed) {
+        this.inFlightUpdates.delete(dedupeKey);
+        this.processedUpdates.set(dedupeKey, Date.now());
+        this.logger.warn({ updateId }, 'Skipped Telegram update already forwarded to Zalo (redelivery).');
+        return;
+      }
+    }
+
     try {
       if (type === 'text') {
         await routed.bridge.forwardTelegramText(ctx, routed.mapping);
@@ -987,6 +1086,7 @@ class SharedTelegramRuntime {
         }
       }
     } catch (error) {
+      if (dedupeKey) this.processedUpdates.set(dedupeKey, Date.now());
       this.logger.error(
         {
           error,
@@ -1201,30 +1301,51 @@ export class TelegramBridgeBot {
 
   async sendZaloMessageToTelegram(mapping, zaloMessage) {
     const chatId = this.config.telegramForumChatId;
-    const send = (action) => this.runtime.groupQueue.run(chatId, action, this.forwardingAbort.signal);
+    // Zalo -> Telegram: a rare duplicate in the topic is better than a lost
+    // message, so allow one retry after an ambiguous timeout here.
+    const send = (action) => this.runtime.groupQueue.run(chatId, action, this.forwardingAbort.signal, { retryAmbiguous: true });
     const options = { message_thread_id: mapping.topicId };
+    const caption = formatZaloMessage(zaloMessage).slice(0, 1024);
+    const sendAsText = (note = '') => send(() => this.bot.telegram.sendMessage(
+      chatId,
+      `${formatZaloMessage(zaloMessage)}${note ? `\n${note}` : ''}\n${zaloMessage.attachment.url}`.slice(0, 4096),
+      options,
+    ));
+    const passThrough = (error) => this.forwardingAbort.signal.aborted || isTelegramThreadNotFound(error) ||
+      telegramRateLimitSeconds(error) !== null || isTelegramDestinationError(error);
 
     if (zaloMessage.attachment?.url) {
+      let file;
       try {
-        return await send(() => this.bot.telegram.sendPhoto(
-          chatId,
-          Input.fromURL(zaloMessage.attachment.url),
-          {
-            ...options,
-            caption: formatZaloMessage(zaloMessage).slice(0, 1024),
-          },
-        ));
+        file = await (this.downloadAttachment || downloadZaloAttachment)(zaloMessage.attachment);
       } catch (error) {
-        if (this.forwardingAbort.signal.aborted || isTelegramThreadNotFound(error) ||
-            telegramRateLimitSeconds(error) !== null || isTelegramDestinationError(error)) throw error;
-        this.logger.warn({ error }, 'Telegram could not fetch Zalo attachment URL; falling back to text.');
-        return await send(() => this.bot.telegram.sendMessage(
-          chatId,
-          `${formatZaloMessage(zaloMessage)}\n${zaloMessage.attachment.url}`,
-          options,
-        ));
+        if (this.forwardingAbort.signal.aborted) throw error;
+        this.logger.warn({ error: humanError(error), url: zaloMessage.attachment.url }, 'Could not download Zalo attachment; sending link instead.');
+        return sendAsText(error?.tooLarge ? '(Tệp lớn hơn 20 MB, mở link để tải)' : '(Không tải được tệp, mở link để xem)');
       }
-      return;
+      const upload = (method) => send(() => this.bot.telegram[method](
+        chatId,
+        Input.fromBuffer(file.buffer, file.filename),
+        { ...options, caption },
+      ));
+      const method = file.kind === 'photo' ? 'sendPhoto' : file.kind === 'video' ? 'sendVideo' : 'sendDocument';
+      try {
+        return await upload(method);
+      } catch (error) {
+        if (passThrough(error)) throw error;
+        if (method !== 'sendDocument' && Number(error?.response?.error_code) === 400) {
+          // e.g. PHOTO_INVALID_DIMENSIONS / IMAGE_PROCESS_FAILED: still deliver the file.
+          this.logger.warn({ error: humanError(error) }, `Telegram rejected ${method}; retrying as document.`);
+          try {
+            return await upload('sendDocument');
+          } catch (documentError) {
+            if (passThrough(documentError)) throw documentError;
+            error = documentError;
+          }
+        }
+        this.logger.warn({ error: humanError(error) }, 'Could not upload Zalo attachment to Telegram; sending link instead.');
+        return sendAsText('(Không gửi được tệp, mở link để xem)');
+      }
     }
 
     return send(() => this.bot.telegram.sendMessage(

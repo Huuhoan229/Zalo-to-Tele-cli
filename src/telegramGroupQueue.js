@@ -7,20 +7,48 @@ export function telegramRateLimitSeconds(error) {
   return Number.isFinite(seconds) && seconds > 0 ? seconds : 3;
 }
 
+// Errors where Telegram certainly did NOT accept the request: its gateway
+// failed or we never reached it. Retrying cannot create a duplicate message.
+const UNREACHED_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH']);
+export function isTelegramUnreachedError(error) {
+  const status = Number(error?.response?.error_code);
+  if (status === 502 || status === 503 || status === 504) return true;
+  const code = error?.code || error?.errno || error?.cause?.code;
+  return UNREACHED_CODES.has(code);
+}
+
+// Errors where the request may or may not have reached Telegram (our own
+// deadline fired, or the connection dropped mid-request). A retry may duplicate.
+export function isTelegramAmbiguousError(error) {
+  if (error?.name === 'AbortError' || error?.type === 'aborted' || error?.type === 'request-timeout') return true;
+  const code = error?.code || error?.cause?.code;
+  return code === 'ECONNRESET' || code === 'ETIMEDOUT' || /socket hang up/i.test(String(error?.message || ''));
+}
+
 // One queue per destination group, shared by all Zalo accounts and topics on this bot.
 export class TelegramGroupQueue {
-  constructor({ wait = sleep, now = Date.now } = {}) {
+  constructor({ wait = sleep, now = Date.now, transientDelaysMs = [2000, 5000] } = {}) {
     this.wait = wait;
     this.now = now;
+    this.transientDelaysMs = transientDelaysMs;
     this.groups = new Map();
   }
 
-  run(chatId, send, signal) {
+  /**
+   * @param {object} [options]
+   * @param {boolean} [options.retryAmbiguous] retry ONCE after a timeout/connection reset.
+   *   Only for idempotent-enough sends where a rare duplicate beats a lost message.
+   *   Never use it for createForumTopic (would create duplicate topics).
+   */
+  run(chatId, send, signal, { retryAmbiguous = false } = {}) {
     const key = String(chatId);
     const group = this.groups.get(key) || { tail: Promise.resolve(), sentAt: [], retryAt: 0 };
     this.groups.set(key, group);
     const task = group.tail.then(async () => {
-      for (let attempt = 0; ; attempt++) {
+      let rateLimitRetries = 0;
+      let transientRetries = 0;
+      let ambiguousRetries = 0;
+      for (;;) {
         signal?.throwIfAborted();
         const now = this.now();
         group.sentAt = group.sentAt.filter((at) => now - at < 61000);
@@ -36,11 +64,22 @@ export class TelegramGroupQueue {
         try {
           return await send();
         } catch (error) {
+          if (signal?.aborted) throw error;
           const seconds = telegramRateLimitSeconds(error);
-          // Only retry requests explicitly rejected by Telegram, not ambiguous timeouts.
-          if (seconds === null) throw error;
-          group.retryAt = this.now() + seconds * 1000 + 250;
-          if (attempt >= 3 || seconds > 120) throw error;
+          if (seconds !== null) {
+            group.retryAt = this.now() + seconds * 1000 + 250;
+            if (rateLimitRetries++ >= 3 || seconds > 120) throw error;
+            continue;
+          }
+          let delay = null;
+          if (isTelegramUnreachedError(error) && transientRetries < this.transientDelaysMs.length) {
+            delay = this.transientDelaysMs[transientRetries++];
+          } else if (retryAmbiguous && isTelegramAmbiguousError(error) && ambiguousRetries < 1) {
+            ambiguousRetries += 1;
+            delay = this.transientDelaysMs[0] ?? 2000;
+          }
+          if (delay === null) throw error;
+          group.retryAt = this.now() + delay;
         }
       }
     });

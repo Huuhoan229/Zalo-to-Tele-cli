@@ -62,7 +62,13 @@ test('real HTTP webhook handles management commands and survives stale deploymen
     });
     assert.equal(response.status, 200);
     await response.text();
-    const reply = calls.slice(before).findLast((call) => call.method === 'sendMessage');
+    // The webhook is acknowledged before the update is handled, so wait for
+    // the reply to reach the (fake) Telegram API.
+    let reply;
+    for (let i = 0; i < 100 && !reply; i++) {
+      reply = calls.slice(before).findLast((call) => call.method === 'sendMessage');
+      if (!reply) await new Promise((resolve) => setTimeout(resolve, 20));
+    }
     assert.ok(reply, 'the webhook must actually send a Telegram reply, not only acknowledge HTTP');
     return reply.payload;
   }
