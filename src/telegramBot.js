@@ -6,6 +6,7 @@ import { ensureDir, uniqueDownloadPath } from './media.js';
 import { boundTelegramApi, BoundedTelegramContext, normalizedMenuText } from './telegramTransport.js';
 import { TelegramGroupQueue, telegramRateLimitSeconds } from './telegramGroupQueue.js';
 import { getVietnamDateParts } from './evn.js';
+import { PRESET_VIETNAM_LOCATIONS } from './weather.js';
 
 const runtimes = new Map();
 const MAX_TELEGRAM_DOWNLOAD_BYTES = 20 * 1024 * 1024;
@@ -21,8 +22,8 @@ const MANAGEMENT_MENU = Markup.keyboard([
   ['💬 Chat với AI', '🔗 Kết nối Zalo'],
   ['➕ Thêm tài khoản Zalo', '📋 Tài khoản Zalo'],
   ['🤖 Bật/tắt AI Zalo', '📊 Trạng thái'],
-  ['⚡ Tiền điện EVN', '🔐 Quyền chat AI'],
-  ['🧹 Xóa lịch sử AI'],
+  ['⚡ Tiền điện EVN', '🌤 Thời tiết'],
+  ['🔐 Quyền chat AI', '🧹 Xóa lịch sử AI'],
 ]).resize();
 const AI_USER_MENU = Markup.keyboard([['💬 Chat với AI'], ['🧹 Xóa lịch sử AI']]).resize();
 
@@ -610,12 +611,21 @@ class SharedTelegramRuntime {
         );
         return { skipped: 'waiting-new-reading', latestReadingDate: report.latestReadingDate };
       }
-      const delivery = await this.deliverEvnReport({ report, text, config });
+      let weatherText = null;
+      if (config.weatherEnabled !== false && typeof this.manager.fetchWeatherReport === 'function') {
+        try {
+          const w = await this.manager.fetchWeatherReport({ now });
+          weatherText = w?.text || null;
+        } catch (weatherError) {
+          this.logger.warn({ error: humanError(weatherError) }, 'Could not fetch daily weather report.');
+        }
+      }
+      const delivery = await this.deliverEvnReport({ report, text, weatherText, config });
       await this.manager.updateEvnConfig({
         lastReportDate: vn.isoDate,
         lastReportedReadingDate: report.latestReadingDate,
       });
-      return { delivered: true, report, text, delivery };
+      return { delivered: true, report, text, weatherText, delivery };
     })().finally(() => {
       this.evnCheckPromise = null;
     });
@@ -625,18 +635,23 @@ class SharedTelegramRuntime {
   async deliverEvnReport({
     report,
     text,
+    weatherText = null,
     config = null,
     destinations = { privateChat: true, forumTopic: true, zalo: true },
   }) {
     const evnConfig = config || (await this.manager.getEvnConfig());
     const results = { privateChat: false, forumTopic: false, zalo: false, errors: [] };
+    const messagesToSend = [text, weatherText].filter(Boolean);
+    if (messagesToSend.length === 0) return results;
 
-    // 1. Chat riêng Bot Telegram quản lý
+    // 1. Chat riêng Bot Telegram quản lý (gửi 2 tin nhắn riêng biệt: 1 tin điện + 1 tin thời tiết)
     if (destinations.privateChat) {
       const admins = [...(this.config.telegramAdminIds || [])];
       for (const adminId of admins) {
         try {
-          await this.bot.telegram.sendMessage(adminId, text);
+          for (const msg of messagesToSend) {
+            await this.bot.telegram.sendMessage(adminId, msg);
+          }
           results.privateChat = true;
         } catch (error) {
           results.errors.push(`Chat riêng (${adminId}): ${humanError(error)}`);
@@ -644,7 +659,7 @@ class SharedTelegramRuntime {
       }
     }
 
-    // 2. Topic riêng trong nhóm Forum Telegram
+    // 2. Topic riêng trong nhóm Forum Telegram (gửi 2 tin nhắn riêng biệt)
     if (destinations.forumTopic) {
       const candidateChatIds = [
         evnConfig.telegramForumChatId,
@@ -677,11 +692,15 @@ class SharedTelegramRuntime {
             await createEvnTopic();
           }
           try {
-            await send(() => this.bot.telegram.sendMessage(chatId, text, { message_thread_id: topicId }));
+            for (const msg of messagesToSend) {
+              await send(() => this.bot.telegram.sendMessage(chatId, msg, { message_thread_id: topicId }));
+            }
           } catch (error) {
             if (!isTelegramThreadNotFound(error)) throw error;
             await createEvnTopic();
-            await send(() => this.bot.telegram.sendMessage(chatId, text, { message_thread_id: topicId }));
+            for (const msg of messagesToSend) {
+              await send(() => this.bot.telegram.sendMessage(chatId, msg, { message_thread_id: topicId }));
+            }
           }
           results.forumTopic = true;
           lastForumError = null;
@@ -695,7 +714,7 @@ class SharedTelegramRuntime {
       }
     }
 
-    // 3. Cuộc trò chuyện / nhóm gia đình trên Zalo
+    // 3. Cuộc trò chuyện / nhóm gia đình trên Zalo (gửi 2 tin nhắn riêng biệt)
     if (destinations.zalo && evnConfig.zaloConversationId && this.manager) {
       try {
         let controller = evnConfig.zaloAccountId ? this.manager.getController(evnConfig.zaloAccountId) : null;
@@ -709,16 +728,18 @@ class SharedTelegramRuntime {
         }
         const mapping = controller.store?.getByConversation?.(evnConfig.zaloConversationId);
         const threadType = mapping?.threadType ?? evnConfig.zaloThreadType ?? 0;
-        controller.registerPendingEcho?.(evnConfig.zaloConversationId, text);
-        try {
-          await controller.zalo.sendText({
-            conversationId: String(evnConfig.zaloConversationId),
-            threadType,
-            text,
-          });
-        } catch (sendError) {
-          controller.consumePendingEcho?.(evnConfig.zaloConversationId);
-          throw sendError;
+        for (const msg of messagesToSend) {
+          controller.registerPendingEcho?.(evnConfig.zaloConversationId, msg);
+          try {
+            await controller.zalo.sendText({
+              conversationId: String(evnConfig.zaloConversationId),
+              threadType,
+              text: msg,
+            });
+          } catch (sendError) {
+            controller.consumePendingEcho?.(evnConfig.zaloConversationId);
+            throw sendError;
+          }
         }
         results.zalo = true;
       } catch (error) {
@@ -1163,10 +1184,74 @@ class SharedTelegramRuntime {
     });
 
     const evnActionButtons = (config) => Markup.inlineKeyboard([
-      [Markup.button.callback('🔄 Lấy số điện ngay', 'evn:now'), Markup.button.callback('📤 Gửi cả 3 nơi', 'evn:send3')],
-      [Markup.button.callback('💬 Chọn nơi nhận Zalo', 'evn:zalo'), Markup.button.callback('🔑 Đổi mật khẩu EVN', 'evn:pass')],
-      [Markup.button.callback('⚙️ Đổi TK / Mã KH', 'evn:edit'), Markup.button.callback(config?.enabled === false ? '▶️ Bật báo 6h sáng' : '⏸ Tắt báo 6h sáng', 'evn:toggle')],
+      [Markup.button.callback('🔄 Lấy số điện ngay', 'evn:now'), Markup.button.callback('🌤 Xem thời tiết', 'weather:now')],
+      [Markup.button.callback('📤 Gửi cả 3 nơi (2 tin: Điện + Thời tiết)', 'evn:send3')],
+      [Markup.button.callback(`📍 Đổi địa điểm (${config?.weatherLocationName || 'Hà Nội'})`, 'weather:loc'), Markup.button.callback('💬 Chọn nơi nhận Zalo', 'evn:zalo')],
+      [Markup.button.callback('🔑 Đổi mật khẩu EVN', 'evn:pass'), Markup.button.callback('⚙️ Đổi TK / Mã KH', 'evn:edit')],
+      [Markup.button.callback(config?.enabled === false ? '▶️ Bật báo 6h sáng' : '⏸ Tắt báo 6h sáng', 'evn:toggle')],
     ]);
+
+    const weatherActionButtons = (config) => Markup.inlineKeyboard([
+      [Markup.button.callback('🔄 Làm mới thời tiết', 'weather:now'), Markup.button.callback('📤 Gửi thời tiết cả 3 nơi', 'weather:send3')],
+      [Markup.button.callback(`📍 Đổi địa điểm (${config?.weatherLocationName || 'Hà Nội'})`, 'weather:loc'), Markup.button.callback('⚡ Xem tiền điện EVN', 'evn:now')],
+    ]);
+
+    const showWeatherLocationPicker = async (ctx) => {
+      const config = (await this.manager?.getEvnConfig?.()) || {};
+      const currentName = config.weatherLocationName || 'Hà Nội';
+      const rows = [];
+      for (let i = 0; i < PRESET_VIETNAM_LOCATIONS.length; i += 2) {
+        const pair = PRESET_VIETNAM_LOCATIONS.slice(i, i + 2).map((item) => {
+          const active = item.name === currentName;
+          return Markup.button.callback(`${active ? '✅ ' : '📍 '}${item.name}`, `wloc:set:${item.key}`);
+        });
+        rows.push(pair);
+      }
+      rows.push([Markup.button.callback('✍️ Nhập tên Quận/Huyện/Tỉnh bất kỳ...', 'wloc:custom')]);
+      return ctx.reply(
+        `📍 Địa điểm dự báo thời tiết hiện tại: ${currentName}\n\n👇 Bấm chọn nhanh bên dưới hoặc gõ:\n/diadiem <tên địa điểm> (ví dụ: /diadiem Cầu Giấy, Hà Nội)`,
+        Markup.inlineKeyboard(rows),
+      );
+    };
+
+    const showWeatherPanel = async (ctx, { broadcast = false } = {}) => {
+      if (!isAdmin(ctx)) return deny(ctx);
+      if (!this.manager?.fetchWeatherReport) return ctx.reply('Tính năng thời tiết chưa sẵn sàng.');
+      const config = await this.manager.getEvnConfig();
+      try {
+        const { text } = await this.manager.fetchWeatherReport();
+        if (broadcast) {
+          const delivery = await this.deliverEvnReport({
+            report: { area: 'EVN' },
+            text: null,
+            weatherText: text,
+            config,
+          });
+          const sentPlaces = [
+            delivery.privateChat ? 'Chat riêng bot' : null,
+            delivery.forumTopic ? 'Topic Forum Telegram' : null,
+            delivery.zalo ? `Zalo (${config.zaloConversationTitle || config.zaloConversationId})` : null,
+          ].filter(Boolean);
+          const warn = delivery.errors.length ? `\n⚠️ Lỗi: ${delivery.errors.join(' | ')}` : '';
+          return ctx.reply(`✅ Đã gửi bản tin dự báo thời tiết tới: ${sentPlaces.join(', ') || '(chưa gửi được)'}${warn}`, weatherActionButtons(config));
+        }
+        return ctx.reply(text, weatherActionButtons(config));
+      } catch (error) {
+        return ctx.reply(`⚠️ Không lấy được dự báo thời tiết:\n${humanError(error)}`, weatherActionButtons(config));
+      }
+    };
+
+    const applyWeatherLocationInput = async (ctx, query) => {
+      const trimmed = String(query || '').trim();
+      if (!trimmed) return showWeatherLocationPicker(ctx);
+      try {
+        const { location } = await this.manager.setWeatherLocation(trimmed);
+        await ctx.reply(`✅ Đã đặt địa điểm dự báo thời tiết 6h sáng: 📍 ${location.name} (${location.latitude.toFixed(4)}, ${location.longitude.toFixed(4)})`);
+        await showWeatherPanel(ctx);
+      } catch (error) {
+        await ctx.reply(`⚠️ ${humanError(error)}`);
+      }
+    };
 
     const showEvnZaloPicker = async (ctx, prefixNote = '') => {
       const buttons = [];
@@ -1259,20 +1344,32 @@ class SharedTelegramRuntime {
       }
       try {
         const { report, text } = await this.manager.fetchEvnReport();
+        let weatherText = null;
+        if (config.weatherEnabled !== false && typeof this.manager.fetchWeatherReport === 'function') {
+          try {
+            const w = await this.manager.fetchWeatherReport();
+            weatherText = w?.text || null;
+          } catch {
+            weatherText = null;
+          }
+        }
         if (broadcast) {
-          const delivery = await this.deliverEvnReport({ report, text, config });
+          const delivery = await this.deliverEvnReport({ report, text, weatherText, config });
           const sentPlaces = [
             delivery.privateChat ? 'Chat riêng bot' : null,
             delivery.forumTopic ? 'Topic Forum Telegram' : null,
             delivery.zalo ? `Zalo (${config.zaloConversationTitle || config.zaloConversationId})` : null,
           ].filter(Boolean);
           const warn = delivery.errors.length ? `\n⚠️ Lỗi: ${delivery.errors.join(' | ')}` : '';
-          return ctx.reply(`✅ Đã gửi báo cáo điện tới: ${sentPlaces.join(', ') || '(chưa gửi được)'}${warn}`, evnActionButtons(config));
+          return ctx.reply(
+            `✅ Đã gửi 2 tin nhắn riêng (1 tin Điện EVN + 1 tin Thời tiết ${config.weatherLocationName || 'Hà Nội'}) tới: ${sentPlaces.join(', ') || '(chưa gửi được)'}${warn}`,
+            evnActionButtons(config),
+          );
         }
         const zaloTarget = config.zaloConversationId
           ? `${config.zaloConversationTitle || config.zaloConversationId} [${config.zaloAccountId || 'auto'}]`
-          : '(chưa chọn — vào topic Zalo rồi gõ /evnzalo)';
-        const footer = `\n\n⏰ Báo tự động ${config.reportHour ?? 6}h sáng: ${config.enabled === false ? 'Đang tắt' : 'Đang bật'}\n💬 Nơi nhận Zalo: ${zaloTarget}`;
+          : '(chưa chọn — bấm "💬 Chọn nơi nhận Zalo" bên dưới)';
+        const footer = `\n\n⏰ Báo tự động ${config.reportHour ?? 6}h sáng (2 tin: Điện + Thời tiết): ${config.enabled === false ? 'Đang tắt' : 'Đang bật'}\n📍 Địa điểm thời tiết: ${config.weatherLocationName || 'Hà Nội'}\n💬 Nơi nhận Zalo: ${zaloTarget}`;
         return ctx.reply(`${text}${footer}`, evnActionButtons(config));
       } catch (error) {
         return ctx.reply(
@@ -1285,6 +1382,52 @@ class SharedTelegramRuntime {
     this.bot.command(['dien', 'evn'], async (ctx) => {
       const arg = String(ctx.message?.text || '').split(/\s+/)[1]?.toLowerCase();
       await showEvnPanel(ctx, { broadcast: arg === 'send' || arg === 'all' || arg === '3' });
+    });
+
+    this.bot.command(['thoitiet', 'weather', 'tt'], async (ctx) => {
+      const arg = String(ctx.message?.text || '').split(/\s+/)[1]?.toLowerCase();
+      await showWeatherPanel(ctx, { broadcast: arg === 'send' || arg === 'all' || arg === '3' });
+    });
+
+    this.bot.command(['diadiem', 'weatherloc'], async (ctx) => {
+      if (!isAdmin(ctx)) return deny(ctx);
+      const rawArgs = String(ctx.message?.text || '').replace(/^\/(?:diadiem|weatherloc)(?:@\w+)?\s*/i, '').trim();
+      await applyWeatherLocationInput(ctx, rawArgs);
+    });
+
+    this.bot.action('weather:now', async (ctx) => {
+      if (!isAdmin(ctx)) return ctx.answerCbQuery('Chỉ admin mới dùng được.');
+      await ctx.answerCbQuery('Đang lấy dự báo thời tiết...');
+      await showWeatherPanel(ctx, { broadcast: false });
+    });
+
+    this.bot.action('weather:send3', async (ctx) => {
+      if (!isAdmin(ctx)) return ctx.answerCbQuery('Chỉ admin mới dùng được.');
+      await ctx.answerCbQuery('Đang gửi thời tiết vào cả 3 nơi...');
+      await showWeatherPanel(ctx, { broadcast: true });
+    });
+
+    this.bot.action('weather:loc', async (ctx) => {
+      if (!isAdmin(ctx)) return ctx.answerCbQuery('Chỉ admin mới dùng được.');
+      await ctx.answerCbQuery('Chọn địa điểm dự báo thời tiết');
+      await showWeatherLocationPicker(ctx);
+    });
+
+    this.bot.action(/^wloc:set:([^:]+)$/, async (ctx) => {
+      if (!isAdmin(ctx)) return ctx.answerCbQuery('Chỉ admin mới dùng được.');
+      const key = ctx.match[1];
+      await ctx.answerCbQuery('Đang cập nhật địa điểm...');
+      await applyWeatherLocationInput(ctx, key);
+    });
+
+    this.bot.action('wloc:custom', async (ctx) => {
+      if (!isAdmin(ctx)) return ctx.answerCbQuery('Chỉ admin mới dùng được.');
+      const current = await this.manager.getEvnConfig();
+      this.pendingSettings.set(ctx.from.id, { kind: 'weatherloc', expires: Date.now() + 5 * 60 * 1000 });
+      await ctx.answerCbQuery('Nhập tên địa điểm');
+      await ctx.reply(
+        `📍 Hiện đang chọn: ${current.weatherLocationName || 'Hà Nội'}\n\n✍️ Gửi tên Quận/Huyện hoặc Tỉnh/Thành phố bạn muốn cài đặt ở tin nhắn tiếp theo (ví dụ: Dương Nội, Hà Đông hoặc Cầu Giấy, Hà Nội hoặc Đà Nẵng). Gõ /cancel để hủy.`,
+      );
     });
 
     this.bot.command('evnset', async (ctx) => {
@@ -1472,6 +1615,11 @@ class SharedTelegramRuntime {
           await applyEvnCredentialsInput(ctx, text);
           return;
         }
+        if (pending.kind === 'weatherloc') {
+          this.pendingSettings.delete(ctx.from.id);
+          await applyWeatherLocationInput(ctx, text);
+          return;
+        }
         try {
           if (pending.kind === 'forum') await saveForum(ctx, pending.accountId, text);
           else await saveTopic(ctx, pending.accountId, pending.conversationId, text);
@@ -1488,6 +1636,7 @@ class SharedTelegramRuntime {
       }
       if (menuText === 'Quyền chat AI') return showAiUsers(ctx);
       if (menuText === 'Tiền điện EVN') return showEvnPanel(ctx);
+      if (menuText === 'Thời tiết') return showWeatherPanel(ctx);
       if (menuText === 'Xóa lịch sử AI') {
         try {
           await this.manager?.clearAiHistory(ctx.from.id);
@@ -2439,12 +2588,13 @@ export class TelegramBridgeBot {
   async handleZaloEvnCommand(zaloMessage) {
     if (!zaloMessage?.conversationId) return;
     const text = String(zaloMessage.text || '').trim();
-    const match = /^\/(dien|evn|evnzalo)(?:@\w+)?(?:\s|$)/i.exec(text);
+    const match = /^\/(dien|evn|evnzalo|thoitiet|weather|tt|diadiem|weatherloc)(?:@\w+)?(?:\s+(.*))?$/is.exec(text);
     if (!match) return;
     const manager = this.runtime?.manager;
     if (!manager?.getEvnConfig) return;
 
     const cmd = match[1].toLowerCase();
+    const argText = String(match[2] || '').trim();
     const title = zaloMessage.title || zaloMessage.senderName || zaloMessage.conversationId;
     const threadType = zaloMessage.threadType ?? 0;
 
@@ -2470,8 +2620,40 @@ export class TelegramBridgeBot {
         zaloThreadType: threadType,
       });
       await sendZaloReply(
-        `✅ Đã chọn cuộc trò chuyện Zalo "${title}" làm nơi nhận báo cáo điện EVN lúc 06:00 sáng hàng ngày.\nBạn có thể gõ /dien ngay tại đây bất cứ lúc nào để xem số điện!`,
+        `✅ Đã chọn cuộc trò chuyện Zalo "${title}" làm nơi nhận 2 bản tin lúc 06:00 sáng hàng ngày (1 tin Điện EVN + 1 tin Thời tiết).\nBạn có thể gõ /dien hoặc /thoitiet ngay tại đây bất cứ lúc nào!`,
       );
+      return;
+    }
+
+    if (cmd === 'diadiem' || cmd === 'weatherloc') {
+      const current = await manager.getEvnConfig();
+      if (!argText) {
+        await sendZaloReply(
+          `📍 Địa điểm dự báo thời tiết hiện tại: ${current.weatherLocationName || 'Hà Nội'}\nĐể đổi địa điểm, gõ: /diadiem <tên Quận/Huyện hoặc Tỉnh/TP>\nVí dụ: /diadiem Dương Nội, Hà Đông hoặc /diadiem Cầu Giấy, Hà Nội`,
+        );
+        return;
+      }
+      try {
+        const { location } = await manager.setWeatherLocation(argText);
+        await sendZaloReply(`✅ Đã đổi địa điểm dự báo thời tiết sang: 📍 ${location.name}`);
+        const { text: weatherText } = await manager.fetchWeatherReport();
+        await sendZaloReply(weatherText);
+      } catch (error) {
+        await sendZaloReply(`⚠️ ${humanError(error)}`);
+      }
+      return;
+    }
+
+    if (cmd === 'thoitiet' || cmd === 'weather' || cmd === 'tt') {
+      try {
+        if (argText && typeof manager.setWeatherLocation === 'function') {
+          await manager.setWeatherLocation(argText);
+        }
+        const { text: weatherText } = await manager.fetchWeatherReport();
+        await sendZaloReply(weatherText);
+      } catch (error) {
+        await sendZaloReply(`⚠️ Không lấy được dự báo thời tiết:\n${humanError(error)}`);
+      }
       return;
     }
 
@@ -2490,6 +2672,15 @@ export class TelegramBridgeBot {
       await sendZaloReply(reportText);
     } catch (error) {
       await sendZaloReply(`⚠️ Không lấy được dữ liệu EVN:\n${humanError(error)}`);
+    }
+
+    if (currentConfig.weatherEnabled !== false && typeof manager.fetchWeatherReport === 'function') {
+      try {
+        const { text: weatherText } = await manager.fetchWeatherReport();
+        if (weatherText) await sendZaloReply(weatherText);
+      } catch {
+        // Ignore weather failure when requesting /dien
+      }
     }
   }
 

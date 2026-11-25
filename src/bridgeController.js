@@ -192,7 +192,7 @@ export class BridgeController extends EventEmitter {
       this.zalo.onMessage(async (message) => {
         const trimmedText = String(message.text || '').trim();
         const explicitAiRequest = /^\/(?:ask|ai)(?:@\w+)?(?:\s|$)/i.test(trimmedText);
-        const explicitEvnRequest = /^\/(?:dien|evn|evnzalo)(?:@\w+)?(?:\s|$)/i.test(trimmedText);
+        const explicitEvnRequest = /^\/(?:dien|evn|evnzalo|thoitiet|weather|tt|diadiem|weatherloc)(?:@\w+)?(?:\s|$)/i.test(trimmedText);
         if (message.isSelf && this.consumePendingEcho(message.conversationId, message.text, explicitAiRequest || explicitEvnRequest)) {
           const data = message.raw?.data;
           const replyData = data && (data.msgId || data.cliMsgId)

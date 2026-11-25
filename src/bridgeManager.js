@@ -8,6 +8,12 @@ import { BridgeController } from './bridgeController.js';
 import { Store } from './store.js';
 import { completeChat } from './ai.js';
 import { fetchEvnUsage, formatEvnReport } from './evn.js';
+import {
+  DEFAULT_WEATHER_LOCATION,
+  fetchWeatherForecast,
+  formatWeatherReport,
+  resolveWeatherLocation,
+} from './weather.js';
 import { observeZaloLogin } from './loginNotifications.js';
 import {
   createAccountDraft,
@@ -552,11 +558,27 @@ export class BridgeManager extends EventEmitter {
       zaloAccountId: saved.zaloAccountId ?? process.env.EVN_ZALO_ACCOUNT_ID?.trim() ?? null,
       zaloConversationId: saved.zaloConversationId ?? process.env.EVN_ZALO_CONVERSATION_ID?.trim() ?? null,
       zaloConversationTitle: saved.zaloConversationTitle || null,
+      zaloThreadType: saved.zaloThreadType ?? 0,
       telegramEvnTopicId: saved.telegramEvnTopicId ? Number(saved.telegramEvnTopicId) : null,
       telegramForumChatId: saved.telegramForumChatId ? Number(saved.telegramForumChatId) : null,
       lastReportDate: saved.lastReportDate || null,
       lastReportedReadingDate: saved.lastReportedReadingDate || null,
       cachedReport: saved.cachedReport || null,
+      weatherEnabled: saved.weatherEnabled !== undefined ? Boolean(saved.weatherEnabled) : true,
+      weatherLocationName:
+        saved.weatherLocationName ||
+        process.env.WEATHER_LOCATION_NAME?.trim() ||
+        DEFAULT_WEATHER_LOCATION.name,
+      weatherLatitude: Number.isFinite(Number(saved.weatherLatitude))
+        ? Number(saved.weatherLatitude)
+        : Number.isFinite(Number(process.env.WEATHER_LATITUDE))
+          ? Number(process.env.WEATHER_LATITUDE)
+          : DEFAULT_WEATHER_LOCATION.latitude,
+      weatherLongitude: Number.isFinite(Number(saved.weatherLongitude))
+        ? Number(saved.weatherLongitude)
+        : Number.isFinite(Number(process.env.WEATHER_LONGITUDE))
+          ? Number(process.env.WEATHER_LONGITUDE)
+          : DEFAULT_WEATHER_LOCATION.longitude,
       updatedAt: saved.updatedAt || null,
     };
   }
@@ -564,6 +586,34 @@ export class BridgeManager extends EventEmitter {
   async updateEvnConfig(patch) {
     await this.withControlStore((store) => store.setEvnConfig(patch));
     return this.getEvnConfig();
+  }
+
+  async setWeatherLocation(query, options = {}) {
+    const resolver = this.weatherLocationResolver || resolveWeatherLocation;
+    const resolved = await resolver(query, options);
+    const config = await this.updateEvnConfig({
+      weatherLocationName: resolved.name,
+      weatherLatitude: resolved.latitude,
+      weatherLongitude: resolved.longitude,
+      weatherEnabled: true,
+    });
+    return { location: resolved, config };
+  }
+
+  async fetchWeatherReport({ now = new Date() } = {}) {
+    const config = await this.getEvnConfig();
+    const fetcher = this.weatherFetcher || fetchWeatherForecast;
+    const report = await fetcher({
+      locationName: config.weatherLocationName || DEFAULT_WEATHER_LOCATION.name,
+      latitude: config.weatherLatitude ?? DEFAULT_WEATHER_LOCATION.latitude,
+      longitude: config.weatherLongitude ?? DEFAULT_WEATHER_LOCATION.longitude,
+      now,
+    });
+    return {
+      config,
+      report,
+      text: formatWeatherReport(report),
+    };
   }
 
   async fetchEvnReport({ now = new Date() } = {}) {

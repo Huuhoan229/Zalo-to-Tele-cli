@@ -125,6 +125,16 @@ test('6:00 AM Vietnam time scheduler delivers EVN report to all 3 destinations o
     unpaidAmount: 0,
   });
 
+  manager.weatherFetcher = async () => ({
+    locationName: 'Hà Nội',
+    displayDate: '25/11/2026',
+    current: { temperature: 22, feelsLike: 22, humidity: 70, windSpeed: 10, icon: '🌤', text: 'Trời ít mây' },
+    today: { minTemp: 18, maxTemp: 26, feelsMin: 18, feelsMax: 26, rainProbMax: 15, rainSum: 0, uvMax: 5, sunrise: '06:10', sunset: '17:15', icon: '🌤', text: 'Trời ít mây' },
+    periods: {},
+    tomorrow: null,
+    tips: ['✨ Thời tiết dễ chịu'],
+  });
+
   const zaloSent = [];
   manager.controllers.set('zalo1', {
     status: 'running',
@@ -185,22 +195,25 @@ test('6:00 AM Vietnam time scheduler delivers EVN report to all 3 destinations o
     assert.equal(run1.delivery.forumTopic, true);
     assert.equal(run1.delivery.zalo, true);
 
-    // Verify all 3 destinations received the report
+    // Verify all 3 destinations received 2 separate messages (1 EVN + 1 Weather)
     assert.equal(createdTopics.length, 1);
     assert.match(createdTopics[0].name, /Điện lực EVNHANOI/);
-    const privateMsg = tgMessages.find((m) => m.chatId === 111);
-    const topicMsg = tgMessages.find((m) => m.chatId === -10099 && m.options?.message_thread_id === 909);
-    assert.ok(privateMsg, 'admin private chat must receive report');
-    assert.ok(topicMsg, 'dedicated Telegram forum topic must receive report');
-    assert.equal(zaloSent.length, 1);
+    const privateMsgs = tgMessages.filter((m) => m.chatId === 111);
+    const topicMsgs = tgMessages.filter((m) => m.chatId === -10099 && m.options?.message_thread_id === 909);
+    assert.equal(privateMsgs.length, 2, 'admin private chat must receive 2 separate messages');
+    assert.match(privateMsgs[0].text, /BÁO CÁO ĐIỆN NĂNG EVNHANOI/);
+    assert.match(privateMsgs[1].text, /DỰ BÁO THỜI TIẾT HÔM NAY/);
+    assert.equal(topicMsgs.length, 2, 'dedicated Telegram forum topic must receive 2 separate messages');
+    assert.equal(zaloSent.length, 2, 'Zalo conversation must receive 2 separate messages');
     assert.equal(zaloSent[0].conversationId, 'family-group-1');
     assert.match(zaloSent[0].text, /BÁO CÁO ĐIỆN NĂNG EVNHANOI/);
+    assert.match(zaloSent[1].text, /DỰ BÁO THỜI TIẾT HÔM NAY/);
 
     // Subsequent check at 06:15 AM same day -> skipped (no duplicate)
     const at615am = new Date('2026-11-24T23:15:00Z');
     const run2 = await runtime.checkEvnSchedule(at615am);
     assert.equal(run2.skipped, 'already-sent-today');
-    assert.equal(zaloSent.length, 1);
+    assert.equal(zaloSent.length, 2);
   } finally {
     stopTelegramControlBot(runtime);
     runtime.removeBridge(bridge);

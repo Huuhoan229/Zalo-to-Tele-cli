@@ -42,11 +42,21 @@ async function main() {
       if (!configured) return { ok: false, configured: false, lastError: manager.lastEvnError || null };
       try {
         const { report, text, fromCache } = await manager.fetchEvnReport();
+        let weatherText = null;
+        if (nextCfg.weatherEnabled !== false && typeof manager.fetchWeatherReport === 'function') {
+          try {
+            const w = await manager.fetchWeatherReport();
+            weatherText = w?.text || null;
+          } catch {
+            weatherText = null;
+          }
+        }
         let delivered = null;
         if (sendToTelegram && telegramControl) {
           delivered = await telegramControl.deliverEvnReport({
             report,
             text,
+            weatherText,
             config: nextCfg,
             destinations: { privateChat: true, forumTopic: true, zalo: true },
           });
