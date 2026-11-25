@@ -646,22 +646,34 @@ class SharedTelegramRuntime {
 
     // 2. Topic riêng trong nhóm Forum Telegram
     if (destinations.forumTopic) {
-      const bridge = [...this.bridges].find((b) => b.config.accountId === evnConfig.zaloAccountId) || [...this.bridges][0];
-      const chatId = evnConfig.telegramForumChatId || bridge?.config?.telegramForumChatId || this.config.telegramForumChatId;
-      if (chatId && Number(chatId) < 0) {
+      const candidateChatIds = [
+        evnConfig.telegramForumChatId,
+        ...[...this.bridges]
+          .sort((a, b) => (a.config.accountId === evnConfig.zaloAccountId ? -1 : b.config.accountId === evnConfig.zaloAccountId ? 1 : 0))
+          .map((b) => b.config?.telegramForumChatId),
+        this.config.telegramForumChatId,
+      ]
+        .map((id) => Number(id))
+        .filter((id, idx, arr) => Number.isSafeInteger(id) && id < 0 && arr.indexOf(id) === idx);
+
+      let lastForumError = null;
+      for (const chatId of candidateChatIds) {
         const send = (action) => this.groupQueue.run(chatId, action);
-        let topicId = evnConfig.telegramEvnTopicId ? Number(evnConfig.telegramEvnTopicId) : null;
+        let topicId =
+          evnConfig.telegramEvnTopicId && Number(evnConfig.telegramForumChatId) === chatId
+            ? Number(evnConfig.telegramEvnTopicId)
+            : null;
         const createEvnTopic = async () => {
           const created = await send(() => this.bot.telegram.createForumTopic(
             chatId,
             `⚡ Điện lực ${report?.area || 'EVN'} - ${evnConfig.customerId || ''}`.trim().slice(0, 128),
           ));
           topicId = created.message_thread_id;
-          await this.manager.updateEvnConfig({ telegramEvnTopicId: topicId, telegramForumChatId: Number(chatId) });
+          await this.manager.updateEvnConfig({ telegramEvnTopicId: topicId, telegramForumChatId: chatId });
           return topicId;
         };
         try {
-          if (!topicId || Number(evnConfig.telegramForumChatId || chatId) !== Number(chatId)) {
+          if (!topicId) {
             await createEvnTopic();
           }
           try {
@@ -672,9 +684,14 @@ class SharedTelegramRuntime {
             await send(() => this.bot.telegram.sendMessage(chatId, text, { message_thread_id: topicId }));
           }
           results.forumTopic = true;
+          lastForumError = null;
+          break;
         } catch (error) {
-          results.errors.push(`Topic Forum Telegram: ${humanError(error)}`);
+          lastForumError = error;
         }
+      }
+      if (!results.forumTopic && lastForumError) {
+        results.errors.push(`Topic Forum Telegram: ${humanError(lastForumError)}`);
       }
     }
 
