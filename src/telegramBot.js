@@ -1147,8 +1147,48 @@ class SharedTelegramRuntime {
 
     const evnActionButtons = (config) => Markup.inlineKeyboard([
       [Markup.button.callback('🔄 Lấy số điện ngay', 'evn:now'), Markup.button.callback('📤 Gửi cả 3 nơi', 'evn:send3')],
+      [Markup.button.callback('🔑 Đổi mật khẩu EVN', 'evn:pass'), Markup.button.callback('⚙️ Đổi TK / Mã KH', 'evn:edit')],
       [Markup.button.callback(config?.enabled === false ? '▶️ Bật báo 6h sáng' : '⏸ Tắt báo 6h sáng', 'evn:toggle')],
     ]);
+
+    const applyEvnCredentialsInput = async (ctx, rawInput) => {
+      const current = await this.manager.getEvnConfig();
+      const tokens = String(rawInput || '').trim().split(/\s+/).filter(Boolean);
+      if (tokens.length === 1 && current.username && current.customerId) {
+        await this.manager.updateEvnConfig({ password: tokens[0], enabled: true });
+        await ctx.reply(`✅ Đã cập nhật mật khẩu EVN mới cho tài khoản ${current.username} (${current.customerId}). Đang kiểm tra kết nối...`);
+        await showEvnPanel(ctx);
+        return true;
+      }
+      if (tokens.length < 3) {
+        await ctx.reply(
+          current.username && current.customerId
+            ? `Dùng:\n• Đổi riêng mật khẩu: /evnpass <mật_khẩu_mới>\n• Đổi toàn bộ: /evnset <tài_khoản> <mật_khẩu> <mã_KH_PD...> [ngày_đầu_kỳ]\n(Hiện đang lưu TK: ${current.username} · Mã KH: ${current.customerId})`
+            : 'Dùng: /evnset <tài_khoản> <mật_khẩu> <mã_KH_PD...> [ngày_đầu_kỳ]\nVí dụ: /evnset 0912345678 MatKhau123 PD01001234567 1',
+        );
+        return false;
+      }
+      let billingStartDay = current.billingStartDay || 1;
+      let endIndex = tokens.length;
+      const lastNum = Number(tokens[tokens.length - 1]);
+      if (tokens.length >= 4 && Number.isInteger(lastNum) && lastNum >= 1 && lastNum <= 28) {
+        billingStartDay = lastNum;
+        endIndex -= 1;
+      }
+      const username = tokens[0];
+      const customerId = tokens[endIndex - 1].toUpperCase();
+      const password = tokens.slice(1, endIndex - 1).join(' ');
+      await this.manager.updateEvnConfig({
+        username,
+        password,
+        customerId,
+        billingStartDay,
+        enabled: true,
+      });
+      await ctx.reply(`✅ Đã lưu cấu hình EVN mới cho TK ${username} · Mã KH ${customerId} (ngày đầu kỳ: ${billingStartDay}). Đang kiểm tra kết nối...`);
+      await showEvnPanel(ctx);
+      return true;
+    };
 
     const showEvnPanel = async (ctx, { broadcast = false } = {}) => {
       if (!isAdmin(ctx)) return deny(ctx);
@@ -1186,7 +1226,10 @@ class SharedTelegramRuntime {
         const footer = `\n\n⏰ Báo tự động ${config.reportHour ?? 6}h sáng: ${config.enabled === false ? 'Đang tắt' : 'Đang bật'}\n💬 Nơi nhận Zalo: ${zaloTarget}`;
         return ctx.reply(`${text}${footer}`, evnActionButtons(config));
       } catch (error) {
-        return ctx.reply(`⚠️ Không lấy được dữ liệu EVN: ${humanError(error)}`, evnActionButtons(config));
+        return ctx.reply(
+          `⚠️ Không lấy được dữ liệu EVN (TK: ${config.username} · Mã KH: ${config.customerId}):\n${humanError(error)}\n\n👉 Bấm "🔑 Đổi mật khẩu EVN" bên dưới hoặc gõ:\n/evnpass <mật_khẩu_mới>\nhoặc:\n/evnset ${config.username} <mật_khẩu_mới> ${config.customerId} ${config.billingStartDay || 1}`,
+          evnActionButtons(config),
+        );
       }
     };
 
@@ -1198,20 +1241,21 @@ class SharedTelegramRuntime {
     this.bot.command('evnset', async (ctx) => {
       if (!isAdmin(ctx)) return deny(ctx);
       await ctx.deleteMessage().catch(() => {});
-      const parts = String(ctx.message?.text || '').trim().split(/\s+/);
-      const [, username, password, customerId, billingStartDay] = parts;
-      if (!username || !password || !customerId) {
-        return ctx.reply('Dùng: /evnset <tài_khoản> <mật_khẩu> <mã_KH_PD...> [ngày_đầu_kỳ]\nVí dụ: /evnset 0912345678 MatKhau123 PD01001234567 1');
+      const rawArgs = String(ctx.message?.text || '').replace(/^\/evnset(?:@\w+)?\s*/i, '').trim();
+      await applyEvnCredentialsInput(ctx, rawArgs);
+    });
+
+    this.bot.command('evnpass', async (ctx) => {
+      if (!isAdmin(ctx)) return deny(ctx);
+      await ctx.deleteMessage().catch(() => {});
+      const newPassword = String(ctx.message?.text || '').replace(/^\/evnpass(?:@\w+)?\s*/i, '').trim();
+      const current = await this.manager.getEvnConfig();
+      if (!newPassword) {
+        this.pendingSettings.set(ctx.from.id, { kind: 'evnpass', expires: Date.now() + 5 * 60 * 1000 });
+        return ctx.reply(`🔑 Gửi mật khẩu EVN mới cho tài khoản ${current.username || '(chưa có)'} vào tin nhắn tiếp theo (hoặc gõ /cancel để hủy). Bot sẽ tự xóa tin nhắn mật khẩu của bạn.`);
       }
-      const startDay = billingStartDay ? Math.min(Math.max(Number(billingStartDay) || 1, 1), 28) : 1;
-      await this.manager.updateEvnConfig({
-        username,
-        password,
-        customerId: customerId.toUpperCase(),
-        billingStartDay: startDay,
-        enabled: true,
-      });
-      await ctx.reply(`✅ Đã lưu cấu hình EVN cho mã KH ${customerId.toUpperCase()} (ngày đầu kỳ: ${startDay}). Đang kiểm tra kết nối...`);
+      await this.manager.updateEvnConfig({ password: newPassword, enabled: true });
+      await ctx.reply(`✅ Đã đổi mật khẩu EVN cho tài khoản ${current.username || ''} (${current.customerId || ''}). Đang kiểm tra lại...`);
       await showEvnPanel(ctx);
     });
 
@@ -1273,6 +1317,29 @@ class SharedTelegramRuntime {
       await ctx.reply(`⏰ Báo cáo điện EVN ${next.reportHour}h sáng: ${next.enabled ? 'Đang bật' : 'Đang tắt'}.`, evnActionButtons(next));
     });
 
+    this.bot.action('evn:pass', async (ctx) => {
+      if (!isAdmin(ctx)) return ctx.answerCbQuery('Chỉ admin mới dùng được.');
+      const current = await this.manager.getEvnConfig();
+      this.pendingSettings.set(ctx.from.id, { kind: 'evnpass', expires: Date.now() + 5 * 60 * 1000 });
+      await ctx.answerCbQuery('Nhập mật khẩu EVN mới');
+      await ctx.reply(`🔑 Gửi mật khẩu EVN mới cho tài khoản ${current.username || ''} (${current.customerId || ''}) ở tin nhắn tiếp theo (hoặc /cancel để hủy). Bot sẽ tự xóa tin nhắn mật khẩu ngay khi nhận.`);
+    });
+
+    this.bot.action('evn:edit', async (ctx) => {
+      if (!isAdmin(ctx)) return ctx.answerCbQuery('Chỉ admin mới dùng được.');
+      const current = await this.manager.getEvnConfig();
+      this.pendingSettings.set(ctx.from.id, { kind: 'evnset', expires: Date.now() + 5 * 60 * 1000 });
+      await ctx.answerCbQuery('Nhập thông tin EVN mới');
+      await ctx.reply([
+        `⚙️ Hiện đang lưu: TK ${current.username || '(trống)'} · Mã KH ${current.customerId || '(trống)'} · Ngày đầu kỳ ${current.billingStartDay || 1}`,
+        '',
+        'Gửi thông tin mới ở tin nhắn tiếp theo theo mẫu:',
+        '<tài_khoản> <mật_khẩu> <mã_KH_PD...> [ngày_đầu_kỳ]',
+        'Ví dụ: 0912345678 MatKhauMoi123 PD01001234567 1',
+        '(Hoặc chỉ gửi mỗi mật khẩu mới nếu giữ nguyên tài khoản & mã KH; gõ /cancel để hủy)',
+      ].join('\n'));
+    });
+
     this.bot.on(message('text'), async (ctx, next) => {
       if (ctx.chat?.type !== 'private') return next();
       const text = String(ctx.message.text || '').trim();
@@ -1294,6 +1361,20 @@ class SharedTelegramRuntime {
           }
           if (this.pendingSettings.get(ctx.from.id) === pending) this.pendingSettings.delete(ctx.from.id);
           return showMenu(ctx, `Đã đổi tên hiển thị thành “${account.label}” (${account.id}).`);
+        }
+        if (pending.kind === 'evnpass') {
+          await ctx.deleteMessage().catch(() => {});
+          this.pendingSettings.delete(ctx.from.id);
+          const current = await this.manager.getEvnConfig();
+          await this.manager.updateEvnConfig({ password: text, enabled: true });
+          await ctx.reply(`✅ Đã đổi mật khẩu EVN cho TK ${current.username || ''} (${current.customerId || ''}). Đang kiểm tra kết nối...`);
+          return showEvnPanel(ctx);
+        }
+        if (pending.kind === 'evnset') {
+          await ctx.deleteMessage().catch(() => {});
+          this.pendingSettings.delete(ctx.from.id);
+          await applyEvnCredentialsInput(ctx, text);
+          return;
         }
         try {
           if (pending.kind === 'forum') await saveForum(ctx, pending.accountId, text);
