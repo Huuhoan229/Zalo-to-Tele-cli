@@ -708,7 +708,7 @@ class SharedTelegramRuntime {
           throw new Error('Tài khoản Zalo nhận báo cáo chưa kết nối hoặc đang dừng.');
         }
         const mapping = controller.store?.getByConversation?.(evnConfig.zaloConversationId);
-        const threadType = mapping?.threadType ?? 0;
+        const threadType = mapping?.threadType ?? evnConfig.zaloThreadType ?? 0;
         controller.registerPendingEcho?.(evnConfig.zaloConversationId, text);
         try {
           await controller.zalo.sendText({
@@ -2433,6 +2433,63 @@ export class TelegramBridgeBot {
       })).catch((error) => {
         this.logger.warn({ error: humanError(error), messageId: entry.telegramMessageId }, 'Could not set Telegram message reaction.');
       });
+    }
+  }
+
+  async handleZaloEvnCommand(zaloMessage) {
+    if (!zaloMessage?.conversationId) return;
+    const text = String(zaloMessage.text || '').trim();
+    const match = /^\/(dien|evn|evnzalo)(?:@\w+)?(?:\s|$)/i.exec(text);
+    if (!match) return;
+    const manager = this.runtime?.manager;
+    if (!manager?.getEvnConfig) return;
+
+    const cmd = match[1].toLowerCase();
+    const title = zaloMessage.title || zaloMessage.senderName || zaloMessage.conversationId;
+    const threadType = zaloMessage.threadType ?? 0;
+
+    const sendZaloReply = async (replyText) => {
+      this.pendingEcho?.register?.(zaloMessage.conversationId, replyText);
+      try {
+        await this.zalo.sendText({
+          conversationId: String(zaloMessage.conversationId),
+          threadType,
+          text: replyText,
+        });
+      } catch (error) {
+        this.pendingEcho?.consume?.(zaloMessage.conversationId);
+        throw error;
+      }
+    };
+
+    if (cmd === 'evnzalo') {
+      await manager.updateEvnConfig({
+        zaloAccountId: this.config.accountId,
+        zaloConversationId: String(zaloMessage.conversationId),
+        zaloConversationTitle: title,
+        zaloThreadType: threadType,
+      });
+      await sendZaloReply(
+        `✅ Đã chọn cuộc trò chuyện Zalo "${title}" làm nơi nhận báo cáo điện EVN lúc 06:00 sáng hàng ngày.\nBạn có thể gõ /dien ngay tại đây bất cứ lúc nào để xem số điện!`,
+      );
+      return;
+    }
+
+    const currentConfig = await manager.getEvnConfig();
+    if (!currentConfig.zaloConversationId) {
+      await manager.updateEvnConfig({
+        zaloAccountId: this.config.accountId,
+        zaloConversationId: String(zaloMessage.conversationId),
+        zaloConversationTitle: title,
+        zaloThreadType: threadType,
+      });
+    }
+
+    try {
+      const { text: reportText } = await manager.fetchEvnReport();
+      await sendZaloReply(reportText);
+    } catch (error) {
+      await sendZaloReply(`⚠️ Không lấy được dữ liệu EVN:\n${humanError(error)}`);
     }
   }
 

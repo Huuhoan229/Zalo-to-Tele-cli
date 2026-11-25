@@ -146,8 +146,8 @@ export class BridgeController extends EventEmitter {
         zalo: this.zalo,
         logger: this.logger.child({ scope: `${this.account.label}/telegram` }),
         pendingEcho: {
-          register: (conversationId) => this.registerPendingEcho(conversationId),
-          consume: (conversationId) => this.consumePendingEcho(conversationId),
+          register: (conversationId, expectedText = null) => this.registerPendingEcho(conversationId, expectedText),
+          consume: (conversationId, messageText = null, exactOnly = false) => this.consumePendingEcho(conversationId, messageText, exactOnly),
         },
         onTranscript: async (mapping, entry) => this.recordTranscript(mapping, entry),
         onBridgeError: (event) => {
@@ -190,8 +190,10 @@ export class BridgeController extends EventEmitter {
       });
 
       this.zalo.onMessage(async (message) => {
-        const explicitAiRequest = /^\/(?:ask|ai)(?:@\w+)?(?:\s|$)/i.test(String(message.text || '').trim());
-        if (message.isSelf && this.consumePendingEcho(message.conversationId, message.text, explicitAiRequest)) {
+        const trimmedText = String(message.text || '').trim();
+        const explicitAiRequest = /^\/(?:ask|ai)(?:@\w+)?(?:\s|$)/i.test(trimmedText);
+        const explicitEvnRequest = /^\/(?:dien|evn|evnzalo)(?:@\w+)?(?:\s|$)/i.test(trimmedText);
+        if (message.isSelf && this.consumePendingEcho(message.conversationId, message.text, explicitAiRequest || explicitEvnRequest)) {
           const data = message.raw?.data;
           const replyData = data && (data.msgId || data.cliMsgId)
             ? Object.fromEntries(['content', 'msgType', 'propertyExt', 'uidFrom', 'msgId', 'cliMsgId', 'ts', 'ttl']
@@ -206,7 +208,7 @@ export class BridgeController extends EventEmitter {
         // AI delivery must not depend on Telegram topic creation or permissions.
         const results = await Promise.allSettled([
           this.telegram.forwardZaloMessage(message),
-          this.maybeReplyWithAi(message),
+          explicitEvnRequest ? this.telegram.handleZaloEvnCommand?.(message) : this.maybeReplyWithAi(message),
         ]);
         for (const result of results) {
           if (result.status === 'rejected') this.logger.error({ error: result.reason }, 'Could not process incoming Zalo message.');
