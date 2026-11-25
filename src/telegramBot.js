@@ -1164,9 +1164,41 @@ class SharedTelegramRuntime {
 
     const evnActionButtons = (config) => Markup.inlineKeyboard([
       [Markup.button.callback('🔄 Lấy số điện ngay', 'evn:now'), Markup.button.callback('📤 Gửi cả 3 nơi', 'evn:send3')],
-      [Markup.button.callback('🔑 Đổi mật khẩu EVN', 'evn:pass'), Markup.button.callback('⚙️ Đổi TK / Mã KH', 'evn:edit')],
-      [Markup.button.callback(config?.enabled === false ? '▶️ Bật báo 6h sáng' : '⏸ Tắt báo 6h sáng', 'evn:toggle')],
+      [Markup.button.callback('💬 Chọn nơi nhận Zalo', 'evn:zalo'), Markup.button.callback('🔑 Đổi mật khẩu EVN', 'evn:pass')],
+      [Markup.button.callback('⚙️ Đổi TK / Mã KH', 'evn:edit'), Markup.button.callback(config?.enabled === false ? '▶️ Bật báo 6h sáng' : '⏸ Tắt báo 6h sáng', 'evn:toggle')],
     ]);
+
+    const showEvnZaloPicker = async (ctx, prefixNote = '') => {
+      const buttons = [];
+      const controllers = [...(this.manager?.controllers?.values() || [])];
+      for (const controller of controllers) {
+        const accId = controller.account?.id;
+        const accLabel = controller.account?.label || accId;
+        const selfId = controller.zalo?.selfUserId;
+        if (selfId) {
+          buttons.push([
+            Markup.button.callback(`👤 Chính mình trên ${accLabel} (Cloud/Cá nhân)`, `evnz:self:${accId}`),
+          ]);
+        }
+        const convs = (controller.getConversationList?.() || []).slice(0, 10);
+        for (const conv of convs) {
+          const title = String(conv.title || conv.conversationId).slice(0, 36);
+          buttons.push([
+            Markup.button.callback(`💬 [${accLabel}] ${title}`, `evnz:c:${accId}:${conv.conversationId}`),
+          ]);
+        }
+      }
+      if (buttons.length === 0) {
+        return ctx.reply(
+          `${prefixNote ? `${prefixNote}\n\n` : ''}Hiện chưa có cuộc trò chuyện Zalo nào được lưu. Hãy gửi 1 tin nhắn từ Zalo để bot tạo topic trước, rồi bấm lại "💬 Chọn nơi nhận Zalo".`,
+        );
+      }
+      buttons.push([Markup.button.callback('🚫 Tắt gửi báo cáo sang Zalo', 'evnz:off')]);
+      return ctx.reply(
+        `${prefixNote ? `${prefixNote}\n\n` : ''}👇 Bấm chọn người hoặc nhóm Zalo muốn nhận báo cáo điện 6h sáng:`,
+        Markup.inlineKeyboard(buttons.slice(0, 25)),
+      );
+    };
 
     const applyEvnCredentialsInput = async (ctx, rawInput) => {
       const current = await this.manager.getEvnConfig();
@@ -1283,19 +1315,66 @@ class SharedTelegramRuntime {
         await this.manager.updateEvnConfig({ zaloAccountId: null, zaloConversationId: null, zaloConversationTitle: null });
         return ctx.reply('Đã tắt gửi báo cáo điện EVN sang Zalo.');
       }
-      if (!ctx.message?.message_thread_id) {
-        return ctx.reply('Hãy vào đúng topic Zalo (nhóm gia đình hoặc cá nhân) trong nhóm Forum Telegram rồi gõ /evnzalo để chọn nơi nhận báo cáo điện 6h sáng.');
+      if (ctx.message?.message_thread_id) {
+        const routed = this.findBridgeByTopic(ctx.message.message_thread_id, ctx.chat?.id);
+        if (routed) {
+          await this.manager.updateEvnConfig({
+            zaloAccountId: routed.bridge.config.accountId,
+            zaloConversationId: routed.mapping.conversationId,
+            zaloConversationTitle: routed.mapping.title,
+          });
+          return ctx.reply(`✅ Đã chọn cuộc trò chuyện Zalo “${routed.mapping.title}” [${routed.bridge.config.accountId}] làm nơi nhận báo cáo điện EVN lúc 6h sáng.`);
+        }
+        return showEvnZaloPicker(
+          ctx,
+          'ℹ️ Topic bạn vừa gõ chưa phải là topic do bot tự tạo từ tin nhắn Zalo (hoặc là topic tự tạo tay). Bạn có thể bấm chọn trực tiếp cuộc trò chuyện Zalo ở danh sách dưới đây:',
+        );
       }
-      const routed = this.findBridgeByTopic(ctx.message.message_thread_id, ctx.chat?.id);
-      if (!routed) {
-        return ctx.reply('Topic này chưa liên kết với cuộc trò chuyện Zalo nào.');
-      }
+      return showEvnZaloPicker(ctx);
+    });
+
+    this.bot.action('evn:zalo', async (ctx) => {
+      if (!isAdmin(ctx)) return ctx.answerCbQuery('Chỉ admin mới dùng được.');
+      await ctx.answerCbQuery('Chọn cuộc trò chuyện Zalo');
+      await showEvnZaloPicker(ctx);
+    });
+
+    this.bot.action('evnz:off', async (ctx) => {
+      if (!isAdmin(ctx)) return ctx.answerCbQuery('Chỉ admin mới dùng được.');
+      await this.manager.updateEvnConfig({ zaloAccountId: null, zaloConversationId: null, zaloConversationTitle: null });
+      await ctx.answerCbQuery('Đã tắt gửi Zalo');
+      await ctx.reply('🚫 Đã tắt gửi báo cáo điện EVN sang Zalo.');
+    });
+
+    this.bot.action(/^evnz:self:([^:]+)$/, async (ctx) => {
+      if (!isAdmin(ctx)) return ctx.answerCbQuery('Chỉ admin mới dùng được.');
+      const accountId = ctx.match[1];
+      const controller = this.manager?.getController(accountId);
+      const selfId = controller?.zalo?.selfUserId;
+      if (!selfId) return ctx.answerCbQuery('Tài khoản Zalo này chưa kết nối.');
+      const title = `Cá nhân (${controller.account?.label || accountId})`;
       await this.manager.updateEvnConfig({
-        zaloAccountId: routed.bridge.config.accountId,
-        zaloConversationId: routed.mapping.conversationId,
-        zaloConversationTitle: routed.mapping.title,
+        zaloAccountId: accountId,
+        zaloConversationId: String(selfId),
+        zaloConversationTitle: title,
       });
-      return ctx.reply(`✅ Đã chọn cuộc trò chuyện Zalo “${routed.mapping.title}” [${routed.bridge.config.accountId}] làm nơi nhận báo cáo điện EVN lúc 6h sáng (cùng với Chat riêng bot và Topic Điện lực).`);
+      await ctx.answerCbQuery('Đã lưu nơi nhận Zalo');
+      await ctx.reply(`✅ Đã chọn gửi báo cáo điện EVN vào Zalo “${title}” [${accountId}].`);
+    });
+
+    this.bot.action(/^evnz:c:([^:]+):(.+)$/, async (ctx) => {
+      if (!isAdmin(ctx)) return ctx.answerCbQuery('Chỉ admin mới dùng được.');
+      const [, accountId, conversationId] = ctx.match;
+      const controller = this.manager?.getController(accountId);
+      const mapping = controller?.store?.getByConversation?.(conversationId);
+      const title = mapping?.title || conversationId;
+      await this.manager.updateEvnConfig({
+        zaloAccountId: accountId,
+        zaloConversationId: String(conversationId),
+        zaloConversationTitle: title,
+      });
+      await ctx.answerCbQuery('Đã lưu nơi nhận Zalo');
+      await ctx.reply(`✅ Đã chọn cuộc trò chuyện Zalo “${title}” [${accountId}] làm nơi nhận báo cáo điện EVN lúc 6h sáng.`);
     });
 
     this.bot.command('evnschedule', async (ctx) => {
