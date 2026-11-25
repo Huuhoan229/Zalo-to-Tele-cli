@@ -215,7 +215,10 @@ async function fetchUnifiedEvnCskh({
 
   const headers = {
     'Content-Type': 'application/json',
-    'Accept': 'application/json',
+    'Accept': 'application/json, text/plain, */*',
+    'Origin': 'https://cskh.evn.com.vn',
+    'Referer': 'https://cskh.evn.com.vn/',
+    'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Authorization': `Bearer ${activeToken}`,
     'X-deviceId': deviceId,
@@ -267,10 +270,22 @@ async function fetchUnifiedEvnCskh({
     }),
     signal: AbortSignal.timeout(timeoutMs),
   });
-  const dnJson = await dnRes.json().catch(() => null);
+  const dnRawText = await dnRes.text();
+  let dnJson = null;
+  try {
+    dnJson = JSON.parse(dnRawText);
+  } catch {
+    throw Object.assign(
+      new Error(`Cổng ${tctGateway} từ chối kết nối từ IP máy chủ Koyeb (HTTP ${dnRes.status}: ${dnRawText.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140)})`),
+      { gatewayBlocked: true },
+    );
+  }
   const dailyList = Array.isArray(dnJson?.data) ? dnJson.data : [];
   if (!dnJson?.success || dailyList.length === 0) {
-    throw new Error(`Chưa có dữ liệu điện năng ngày cho mã ${resolvedCustomerId} (${maDdo}) trong kỳ ${fromDate} - ${toDate}.`);
+    throw Object.assign(
+      new Error(`Chưa có dữ liệu điện năng ngày cho mã ${resolvedCustomerId} (${maDdo}) trong kỳ ${fromDate} - ${toDate} (HTTP ${dnRes.status}: ${dnRawText.slice(0, 140)}).`),
+      { gatewayBlocked: dnRes.status !== 200 || !dnJson?.success },
+    );
   }
 
   const first = dailyList[0];

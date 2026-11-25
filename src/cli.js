@@ -28,24 +28,34 @@ async function main() {
     accessToken: config.webAccessToken,
     logger,
     webhookHandlers,
-    onEvnProbe: async (sendToTelegram = false) => {
+    onEvnProbe: async (sendToTelegram = false, pushedReport = null) => {
       const cfg = await manager.getEvnConfig();
-      const configured = Boolean(cfg.username && cfg.password && cfg.customerId);
+      if (pushedReport && pushedReport.customerId && (!cfg.customerId || pushedReport.customerId === cfg.customerId)) {
+        await manager.updateEvnConfig({
+          customerId: pushedReport.customerId,
+          cachedReport: pushedReport,
+          enabled: true,
+        });
+      }
+      const nextCfg = await manager.getEvnConfig();
+      const configured = Boolean((nextCfg.username && nextCfg.password && nextCfg.customerId) || nextCfg.cachedReport);
       if (!configured) return { ok: false, configured: false, lastError: manager.lastEvnError || null };
       try {
-        const { report, text } = await manager.fetchEvnReport();
+        const { report, text, fromCache } = await manager.fetchEvnReport();
         let delivered = null;
         if (sendToTelegram && telegramControl) {
           delivered = await telegramControl.deliverEvnReport({
             report,
             text,
-            config: cfg,
-            destinations: { privateChat: true, forumTopic: false, zalo: false },
+            config: nextCfg,
+            destinations: { privateChat: true, forumTopic: true, zalo: true },
           });
         }
         return {
           ok: true,
           configured: true,
+          fromCache: Boolean(fromCache),
+          lastLiveError: manager.lastEvnError || null,
           area: report.area,
           latestReadingDate: report.latestReadingDate,
           dailyLatestKwh: report.dailyLatestKwh,

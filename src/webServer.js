@@ -324,7 +324,8 @@ export function startWebServer({
       if (url.pathname === '/healthz') {
         if (url.searchParams.get('evn') === '1' && typeof onEvnProbe === 'function') {
           const sendTg = url.searchParams.get('send') === '1';
-          const result = await onEvnProbe(sendTg);
+          const pushed = req.method === 'POST' ? await readRequestBody(req).catch(() => null) : null;
+          const result = await onEvnProbe(sendTg, pushed?.report || pushed || null);
           send(res, 200, `${JSON.stringify(result)}\n`, { 'Content-Type': 'application/json; charset=utf-8' });
           return;
         }

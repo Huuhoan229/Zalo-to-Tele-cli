@@ -556,6 +556,7 @@ export class BridgeManager extends EventEmitter {
       telegramForumChatId: saved.telegramForumChatId ? Number(saved.telegramForumChatId) : null,
       lastReportDate: saved.lastReportDate || null,
       lastReportedReadingDate: saved.lastReportedReadingDate || null,
+      cachedReport: saved.cachedReport || null,
       updatedAt: saved.updatedAt || null,
     };
   }
@@ -578,6 +579,7 @@ export class BridgeManager extends EventEmitter {
       });
       this.lastEvnError = null;
       this.lastEvnFetchAt = new Date().toISOString();
+      await this.updateEvnConfig({ cachedReport: report }).catch(() => {});
       return {
         config,
         report,
@@ -586,6 +588,14 @@ export class BridgeManager extends EventEmitter {
     } catch (error) {
       this.lastEvnError = String(error?.message || error || 'Unknown EVN error').slice(0, 400);
       this.lastEvnFetchAt = new Date().toISOString();
+      if (config.cachedReport && config.cachedReport.customerId === config.customerId) {
+        return {
+          config,
+          report: config.cachedReport,
+          text: formatEvnReport(config.cachedReport),
+          fromCache: true,
+        };
+      }
       throw error;
     }
   }
