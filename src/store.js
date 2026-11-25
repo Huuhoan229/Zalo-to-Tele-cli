@@ -565,6 +565,20 @@ export class Store {
     await this.save();
   }
 
+  getEvnConfig() {
+    return structuredClone(this.state.evn || {});
+  }
+
+  async setEvnConfig(patch) {
+    this.state.evn = {
+      ...(this.state.evn || {}),
+      ...patch,
+      updatedAt: new Date().toISOString(),
+    };
+    await this.save();
+    return this.getEvnConfig();
+  }
+
   async ensureTelegramUpdateClaims() {
     if (!this.useMongo) return null;
     if (this.telegramUpdateClaims) return this.telegramUpdateClaims;

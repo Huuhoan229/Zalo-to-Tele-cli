@@ -7,6 +7,7 @@ import { createLogger } from './logger.js';
 import { BridgeController } from './bridgeController.js';
 import { Store } from './store.js';
 import { completeChat } from './ai.js';
+import { fetchEvnUsage, formatEvnReport } from './evn.js';
 import { observeZaloLogin } from './loginNotifications.js';
 import {
   createAccountDraft,
@@ -529,6 +530,56 @@ export class BridgeManager extends EventEmitter {
 
   async clearAiHistory(userId) {
     return this.withControlStore((store) => store.clearTelegramAiHistory(userId));
+  }
+
+  async getEvnConfig() {
+    const saved = await this.withControlStore((store) => store.getEvnConfig());
+    const envReportHour = process.env.EVN_REPORT_HOUR !== undefined ? Number(process.env.EVN_REPORT_HOUR) : undefined;
+    const envBillingStart = process.env.EVN_BILLING_START_DAY !== undefined ? Number(process.env.EVN_BILLING_START_DAY) : undefined;
+    return {
+      enabled: saved.enabled !== undefined
+        ? Boolean(saved.enabled)
+        : process.env.EVN_ENABLED !== 'false',
+      username: saved.username || process.env.EVN_USERNAME?.trim() || '',
+      password: saved.password || process.env.EVN_PASSWORD || '',
+      customerId: (saved.customerId || process.env.EVN_CUSTOMER_ID?.trim() || '').toUpperCase(),
+      billingStartDay: Number.isFinite(Number(saved.billingStartDay))
+        ? Number(saved.billingStartDay)
+        : (Number.isFinite(envBillingStart) ? envBillingStart : 1),
+      reportHour: Number.isFinite(Number(saved.reportHour))
+        ? Number(saved.reportHour)
+        : (Number.isFinite(envReportHour) ? envReportHour : 6),
+      zaloAccountId: saved.zaloAccountId ?? process.env.EVN_ZALO_ACCOUNT_ID?.trim() ?? null,
+      zaloConversationId: saved.zaloConversationId ?? process.env.EVN_ZALO_CONVERSATION_ID?.trim() ?? null,
+      zaloConversationTitle: saved.zaloConversationTitle || null,
+      telegramEvnTopicId: saved.telegramEvnTopicId ? Number(saved.telegramEvnTopicId) : null,
+      telegramForumChatId: saved.telegramForumChatId ? Number(saved.telegramForumChatId) : null,
+      lastReportDate: saved.lastReportDate || null,
+      lastReportedReadingDate: saved.lastReportedReadingDate || null,
+      updatedAt: saved.updatedAt || null,
+    };
+  }
+
+  async updateEvnConfig(patch) {
+    await this.withControlStore((store) => store.setEvnConfig(patch));
+    return this.getEvnConfig();
+  }
+
+  async fetchEvnReport({ now = new Date() } = {}) {
+    const config = await this.getEvnConfig();
+    const fetcher = this.evnFetcher || fetchEvnUsage;
+    const report = await fetcher({
+      username: config.username,
+      password: config.password,
+      customerId: config.customerId,
+      billingStartDay: config.billingStartDay,
+      now,
+    });
+    return {
+      config,
+      report,
+      text: formatEvnReport(report),
+    };
   }
 
   async requestZaloQr(onQr, accountId = null, onStatus = null) {

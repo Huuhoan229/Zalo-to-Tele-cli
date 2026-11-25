@@ -5,6 +5,7 @@ import fs from 'node:fs/promises';
 import { ensureDir, uniqueDownloadPath } from './media.js';
 import { boundTelegramApi, BoundedTelegramContext, normalizedMenuText } from './telegramTransport.js';
 import { TelegramGroupQueue, telegramRateLimitSeconds } from './telegramGroupQueue.js';
+import { getVietnamDateParts } from './evn.js';
 
 const runtimes = new Map();
 const MAX_TELEGRAM_DOWNLOAD_BYTES = 20 * 1024 * 1024;
@@ -20,7 +21,7 @@ const MANAGEMENT_MENU = Markup.keyboard([
   ['💬 Chat với AI', '🔗 Kết nối Zalo'],
   ['➕ Thêm tài khoản Zalo', '📋 Tài khoản Zalo'],
   ['🤖 Bật/tắt AI Zalo', '📊 Trạng thái'],
-  ['🔐 Quyền chat AI'],
+  ['⚡ Tiền điện EVN', '🔐 Quyền chat AI'],
   ['🧹 Xóa lịch sử AI'],
 ]).resize();
 const AI_USER_MENU = Markup.keyboard([['💬 Chat với AI'], ['🧹 Xóa lịch sử AI']]).resize();
@@ -234,7 +235,7 @@ function telegramSenderName(ctx) {
 
 function humanError(error) {
   let text = String(error?.response?.description || error?.message || error || 'Unknown error');
-  for (const key of [process.env.AI_API_KEY, process.env.ROUTER_API_KEY, process.env.TELEGRAM_BOT_TOKEN]) {
+  for (const key of [process.env.AI_API_KEY, process.env.ROUTER_API_KEY, process.env.TELEGRAM_BOT_TOKEN, process.env.EVN_PASSWORD]) {
     if (key) text = text.replaceAll(key, '[redacted]');
   }
   return text.slice(0, 500);
@@ -273,6 +274,8 @@ class SharedTelegramRuntime {
     this.webhookCheck = null;
     this.webhookState = null;
     this.lastWebhookRequestAt = null;
+    this.evnTimer = null;
+    this.evnCheckPromise = null;
     // Webhook mode: đọc TELEGRAM_WEBHOOK_URL từ env (setting toàn deployment).
     // Nếu không set → fallback về long polling (chạy local).
     const webhookInput = process.env.TELEGRAM_WEBHOOK_URL?.trim() || '';
@@ -317,6 +320,8 @@ class SharedTelegramRuntime {
     this.retryTimer = null;
     clearInterval(this.webhookTimer);
     this.webhookTimer = null;
+    clearInterval(this.evnTimer);
+    this.evnTimer = null;
     if (this.isWebhookMode) {
       webhookHandlers.delete(this.webhookPath);
       // Do not delete a bot-global webhook here: a newer deployment may have
@@ -492,6 +497,10 @@ class SharedTelegramRuntime {
           { command: 'setforum', description: 'Đặt ID nhóm Telegram cho Zalo' },
           { command: 'bindtopic', description: 'Gán cuộc trò chuyện vào topic có sẵn' },
           { command: 'aitest', description: 'Kiểm tra kết nối 9Router và chế độ AI' },
+          { command: 'dien', description: 'Xem số điện và tiền điện EVN' },
+          { command: 'evnset', description: 'Cài tài khoản EVN: /evnset user pass PD...' },
+          { command: 'evnzalo', description: 'Gõ trong topic Zalo để chọn nơi nhận báo cáo điện' },
+          { command: 'undo', description: 'Thu hồi tin nhắn Zalo trong topic' },
           { command: 'topics', description: 'Liệt kê topic Zalo đã liên kết' },
           { command: 'id', description: 'Xem Telegram ID' },
         ]).catch((error) => this.logger.warn({ error }, 'Could not register Telegram command menu.'));
@@ -500,6 +509,7 @@ class SharedTelegramRuntime {
         clearInterval(this.webhookTimer);
         this.webhookTimer = setInterval(() => { void this.refreshWebhook(); }, 20000);
         this.webhookTimer.unref?.();
+        this.startEvnScheduler();
         return;
       }
 
@@ -528,9 +538,14 @@ class SharedTelegramRuntime {
         { command: 'setforum', description: 'Đặt ID nhóm Telegram cho Zalo' },
         { command: 'bindtopic', description: 'Gán cuộc trò chuyện vào topic có sẵn' },
         { command: 'aitest', description: 'Kiểm tra kết nối 9Router và chế độ AI' },
+        { command: 'dien', description: 'Xem số điện và tiền điện EVN' },
+        { command: 'evnset', description: 'Cài tài khoản EVN: /evnset user pass PD...' },
+        { command: 'evnzalo', description: 'Gõ trong topic Zalo để chọn nơi nhận báo cáo điện' },
+        { command: 'undo', description: 'Thu hồi tin nhắn Zalo trong topic' },
         { command: 'topics', description: 'Liệt kê topic Zalo đã liên kết' },
         { command: 'id', description: 'Xem Telegram ID' },
       ]).catch((error) => this.logger.warn({ error }, 'Could not register Telegram command menu.'));
+      this.startEvnScheduler();
       this.pollingTask = this.bot.launch({ dropPendingUpdates: false, allowedUpdates: ['message', 'callback_query', 'message_reaction'] }, () => {
         if (generation !== this.generation) throw new Error('Telegram launch cancelled');
         this.transportStatus = 'running';
@@ -555,6 +570,146 @@ class SharedTelegramRuntime {
       if (mapping) return { bridge, mapping };
     }
     return null;
+  }
+
+  startEvnScheduler() {
+    clearInterval(this.evnTimer);
+    this.evnTimer = setInterval(() => {
+      void this.checkEvnSchedule().catch((error) => {
+        this.logger.warn({ error: humanError(error) }, 'Scheduled EVN check failed.');
+      });
+    }, 10 * 60 * 1000);
+    this.evnTimer.unref?.();
+  }
+
+  async checkEvnSchedule(now = new Date()) {
+    if (!this.manager?.getEvnConfig) return { skipped: 'no-manager' };
+    if (this.evnCheckPromise) return this.evnCheckPromise;
+    this.evnCheckPromise = (async () => {
+      const config = await this.manager.getEvnConfig();
+      if (config.enabled === false || !config.username || !config.password || !config.customerId) {
+        return { skipped: 'not-configured' };
+      }
+      const vn = getVietnamDateParts(now);
+      const reportHour = Number.isFinite(Number(config.reportHour)) ? Number(config.reportHour) : 6;
+      if (vn.hour < reportHour || vn.hour >= reportHour + 4) {
+        return { skipped: 'outside-window', hour: vn.hour, reportHour };
+      }
+      if (config.lastReportDate === vn.isoDate) {
+        return { skipped: 'already-sent-today', date: vn.isoDate };
+      }
+      const { report, text } = await this.manager.fetchEvnReport({ now });
+      if (
+        vn.hour < reportHour + 2 &&
+        config.lastReportedReadingDate &&
+        report.latestReadingDate === config.lastReportedReadingDate
+      ) {
+        this.logger.info(
+          { latestReadingDate: report.latestReadingDate },
+          'EVN has not published a newer daily reading yet; waiting for next morning check.',
+        );
+        return { skipped: 'waiting-new-reading', latestReadingDate: report.latestReadingDate };
+      }
+      const delivery = await this.deliverEvnReport({ report, text, config });
+      await this.manager.updateEvnConfig({
+        lastReportDate: vn.isoDate,
+        lastReportedReadingDate: report.latestReadingDate,
+      });
+      return { delivered: true, report, text, delivery };
+    })().finally(() => {
+      this.evnCheckPromise = null;
+    });
+    return this.evnCheckPromise;
+  }
+
+  async deliverEvnReport({
+    report,
+    text,
+    config = null,
+    destinations = { privateChat: true, forumTopic: true, zalo: true },
+  }) {
+    const evnConfig = config || (await this.manager.getEvnConfig());
+    const results = { privateChat: false, forumTopic: false, zalo: false, errors: [] };
+
+    // 1. Chat riêng Bot Telegram quản lý
+    if (destinations.privateChat) {
+      const admins = [...(this.config.telegramAdminIds || [])];
+      for (const adminId of admins) {
+        try {
+          await this.bot.telegram.sendMessage(adminId, text);
+          results.privateChat = true;
+        } catch (error) {
+          results.errors.push(`Chat riêng (${adminId}): ${humanError(error)}`);
+        }
+      }
+    }
+
+    // 2. Topic riêng trong nhóm Forum Telegram
+    if (destinations.forumTopic) {
+      const bridge = [...this.bridges].find((b) => b.config.accountId === evnConfig.zaloAccountId) || [...this.bridges][0];
+      const chatId = evnConfig.telegramForumChatId || bridge?.config?.telegramForumChatId || this.config.telegramForumChatId;
+      if (chatId && Number(chatId) < 0) {
+        const send = (action) => this.groupQueue.run(chatId, action);
+        let topicId = evnConfig.telegramEvnTopicId ? Number(evnConfig.telegramEvnTopicId) : null;
+        const createEvnTopic = async () => {
+          const created = await send(() => this.bot.telegram.createForumTopic(
+            chatId,
+            `⚡ Điện lực ${report?.area || 'EVN'} - ${evnConfig.customerId || ''}`.trim().slice(0, 128),
+          ));
+          topicId = created.message_thread_id;
+          await this.manager.updateEvnConfig({ telegramEvnTopicId: topicId, telegramForumChatId: Number(chatId) });
+          return topicId;
+        };
+        try {
+          if (!topicId || Number(evnConfig.telegramForumChatId || chatId) !== Number(chatId)) {
+            await createEvnTopic();
+          }
+          try {
+            await send(() => this.bot.telegram.sendMessage(chatId, text, { message_thread_id: topicId }));
+          } catch (error) {
+            if (!isTelegramThreadNotFound(error)) throw error;
+            await createEvnTopic();
+            await send(() => this.bot.telegram.sendMessage(chatId, text, { message_thread_id: topicId }));
+          }
+          results.forumTopic = true;
+        } catch (error) {
+          results.errors.push(`Topic Forum Telegram: ${humanError(error)}`);
+        }
+      }
+    }
+
+    // 3. Cuộc trò chuyện / nhóm gia đình trên Zalo
+    if (destinations.zalo && evnConfig.zaloConversationId && this.manager) {
+      try {
+        let controller = evnConfig.zaloAccountId ? this.manager.getController(evnConfig.zaloAccountId) : null;
+        if (!controller && this.manager.controllers) {
+          controller = [...this.manager.controllers.values()].find(
+            (c) => c.status === 'running' && c.store?.getByConversation?.(evnConfig.zaloConversationId),
+          ) || [...this.manager.controllers.values()].find((c) => c.status === 'running');
+        }
+        if (!controller || !controller.zalo) {
+          throw new Error('Tài khoản Zalo nhận báo cáo chưa kết nối hoặc đang dừng.');
+        }
+        const mapping = controller.store?.getByConversation?.(evnConfig.zaloConversationId);
+        const threadType = mapping?.threadType ?? 0;
+        controller.registerPendingEcho?.(evnConfig.zaloConversationId, text);
+        try {
+          await controller.zalo.sendText({
+            conversationId: String(evnConfig.zaloConversationId),
+            threadType,
+            text,
+          });
+        } catch (sendError) {
+          controller.consumePendingEcho?.(evnConfig.zaloConversationId);
+          throw sendError;
+        }
+        results.zalo = true;
+      } catch (error) {
+        results.errors.push(`Zalo (${evnConfig.zaloConversationTitle || evnConfig.zaloConversationId}): ${humanError(error)}`);
+      }
+    }
+
+    return results;
   }
 
   registerHandlers() {
@@ -990,6 +1145,134 @@ class SharedTelegramRuntime {
       await ctx.reply(`ID được cấp quyền chat AI: ${users.join(', ') || '(chưa có)'}\nAdmin env: ${[...(this.config.telegramAdminIds || [])].join(', ') || '(chưa cấu hình)'}`);
     });
 
+    const evnActionButtons = (config) => Markup.inlineKeyboard([
+      [Markup.button.callback('🔄 Lấy số điện ngay', 'evn:now'), Markup.button.callback('📤 Gửi cả 3 nơi', 'evn:send3')],
+      [Markup.button.callback(config?.enabled === false ? '▶️ Bật báo 6h sáng' : '⏸ Tắt báo 6h sáng', 'evn:toggle')],
+    ]);
+
+    const showEvnPanel = async (ctx, { broadcast = false } = {}) => {
+      if (!isAdmin(ctx)) return deny(ctx);
+      if (!this.manager?.getEvnConfig) return ctx.reply('Bot quản lý chưa sẵn sàng.');
+      const config = await this.manager.getEvnConfig();
+      if (!config.username || !config.password || !config.customerId) {
+        return ctx.reply([
+          '⚡ Chưa cấu hình tài khoản Điện lực EVNHANOI / EVN CSKH.',
+          '',
+          'Cách 1 — Cài ngay trong chat riêng với bot (bot sẽ tự xóa tin chứa mật khẩu):',
+          '/evnset <sđt_hoặc_user> <mật_khẩu> <mã_KH_PD...> [ngày_đầu_kỳ]',
+          'Ví dụ: /evnset 0912345678 MatKhau123 PD01001234567 1',
+          '',
+          'Cách 2 — Thêm biến môi trường trên Koyeb:',
+          'EVN_USERNAME, EVN_PASSWORD, EVN_CUSTOMER_ID, EVN_BILLING_START_DAY=1',
+          '',
+          'Chọn nhóm/người nhận trên Zalo: vào topic Zalo đó trong nhóm Forum Telegram rồi gõ /evnzalo.',
+        ].join('\n'));
+      }
+      try {
+        const { report, text } = await this.manager.fetchEvnReport();
+        if (broadcast) {
+          const delivery = await this.deliverEvnReport({ report, text, config });
+          const sentPlaces = [
+            delivery.privateChat ? 'Chat riêng bot' : null,
+            delivery.forumTopic ? 'Topic Forum Telegram' : null,
+            delivery.zalo ? `Zalo (${config.zaloConversationTitle || config.zaloConversationId})` : null,
+          ].filter(Boolean);
+          const warn = delivery.errors.length ? `\n⚠️ Lỗi: ${delivery.errors.join(' | ')}` : '';
+          return ctx.reply(`✅ Đã gửi báo cáo điện tới: ${sentPlaces.join(', ') || '(chưa gửi được)'}${warn}`, evnActionButtons(config));
+        }
+        const zaloTarget = config.zaloConversationId
+          ? `${config.zaloConversationTitle || config.zaloConversationId} [${config.zaloAccountId || 'auto'}]`
+          : '(chưa chọn — vào topic Zalo rồi gõ /evnzalo)';
+        const footer = `\n\n⏰ Báo tự động ${config.reportHour ?? 6}h sáng: ${config.enabled === false ? 'Đang tắt' : 'Đang bật'}\n💬 Nơi nhận Zalo: ${zaloTarget}`;
+        return ctx.reply(`${text}${footer}`, evnActionButtons(config));
+      } catch (error) {
+        return ctx.reply(`⚠️ Không lấy được dữ liệu EVN: ${humanError(error)}`, evnActionButtons(config));
+      }
+    };
+
+    this.bot.command(['dien', 'evn'], async (ctx) => {
+      const arg = String(ctx.message?.text || '').split(/\s+/)[1]?.toLowerCase();
+      await showEvnPanel(ctx, { broadcast: arg === 'send' || arg === 'all' || arg === '3' });
+    });
+
+    this.bot.command('evnset', async (ctx) => {
+      if (!isAdmin(ctx)) return deny(ctx);
+      await ctx.deleteMessage().catch(() => {});
+      const parts = String(ctx.message?.text || '').trim().split(/\s+/);
+      const [, username, password, customerId, billingStartDay] = parts;
+      if (!username || !password || !customerId) {
+        return ctx.reply('Dùng: /evnset <tài_khoản> <mật_khẩu> <mã_KH_PD...> [ngày_đầu_kỳ]\nVí dụ: /evnset 0912345678 MatKhau123 PD01001234567 1');
+      }
+      const startDay = billingStartDay ? Math.min(Math.max(Number(billingStartDay) || 1, 1), 28) : 1;
+      await this.manager.updateEvnConfig({
+        username,
+        password,
+        customerId: customerId.toUpperCase(),
+        billingStartDay: startDay,
+        enabled: true,
+      });
+      await ctx.reply(`✅ Đã lưu cấu hình EVN cho mã KH ${customerId.toUpperCase()} (ngày đầu kỳ: ${startDay}). Đang kiểm tra kết nối...`);
+      await showEvnPanel(ctx);
+    });
+
+    this.bot.command('evnzalo', async (ctx) => {
+      if (!isAdmin(ctx)) return deny(ctx);
+      const arg = String(ctx.message?.text || '').split(/\s+/)[1]?.toLowerCase();
+      if (arg === 'off' || arg === 'clear' || arg === 'none') {
+        await this.manager.updateEvnConfig({ zaloAccountId: null, zaloConversationId: null, zaloConversationTitle: null });
+        return ctx.reply('Đã tắt gửi báo cáo điện EVN sang Zalo.');
+      }
+      if (!ctx.message?.message_thread_id) {
+        return ctx.reply('Hãy vào đúng topic Zalo (nhóm gia đình hoặc cá nhân) trong nhóm Forum Telegram rồi gõ /evnzalo để chọn nơi nhận báo cáo điện 6h sáng.');
+      }
+      const routed = this.findBridgeByTopic(ctx.message.message_thread_id, ctx.chat?.id);
+      if (!routed) {
+        return ctx.reply('Topic này chưa liên kết với cuộc trò chuyện Zalo nào.');
+      }
+      await this.manager.updateEvnConfig({
+        zaloAccountId: routed.bridge.config.accountId,
+        zaloConversationId: routed.mapping.conversationId,
+        zaloConversationTitle: routed.mapping.title,
+      });
+      return ctx.reply(`✅ Đã chọn cuộc trò chuyện Zalo “${routed.mapping.title}” [${routed.bridge.config.accountId}] làm nơi nhận báo cáo điện EVN lúc 6h sáng (cùng với Chat riêng bot và Topic Điện lực).`);
+    });
+
+    this.bot.command('evnschedule', async (ctx) => {
+      if (!isAdmin(ctx)) return deny(ctx);
+      const parts = String(ctx.message?.text || '').trim().split(/\s+/);
+      const mode = parts[1]?.toLowerCase();
+      const hourArg = parts[2] !== undefined ? Number(parts[2]) : undefined;
+      if (!mode || !['on', 'off'].includes(mode)) {
+        return ctx.reply('Dùng: /evnschedule on [giờ_0_đến_23] hoặc /evnschedule off\nVí dụ: /evnschedule on 6');
+      }
+      const patch = { enabled: mode === 'on' };
+      if (Number.isFinite(hourArg) && hourArg >= 0 && hourArg <= 23) {
+        patch.reportHour = Math.trunc(hourArg);
+      }
+      const updated = await this.manager.updateEvnConfig(patch);
+      return ctx.reply(`⏰ Báo cáo điện EVN tự động: ${updated.enabled ? `Đang bật (${updated.reportHour}h sáng giờ VN)` : 'Đang tắt'}.`);
+    });
+
+    this.bot.action('evn:now', async (ctx) => {
+      if (!isAdmin(ctx)) return ctx.answerCbQuery('Chỉ admin mới dùng được.');
+      await ctx.answerCbQuery('Đang lấy số điện EVN...');
+      await showEvnPanel(ctx, { broadcast: false });
+    });
+
+    this.bot.action('evn:send3', async (ctx) => {
+      if (!isAdmin(ctx)) return ctx.answerCbQuery('Chỉ admin mới dùng được.');
+      await ctx.answerCbQuery('Đang gửi báo cáo vào cả 3 nơi...');
+      await showEvnPanel(ctx, { broadcast: true });
+    });
+
+    this.bot.action('evn:toggle', async (ctx) => {
+      if (!isAdmin(ctx)) return ctx.answerCbQuery('Chỉ admin mới dùng được.');
+      const current = await this.manager.getEvnConfig();
+      const next = await this.manager.updateEvnConfig({ enabled: current.enabled === false });
+      await ctx.answerCbQuery(next.enabled ? 'Đã bật báo cáo 6h sáng' : 'Đã tắt báo cáo 6h sáng');
+      await ctx.reply(`⏰ Báo cáo điện EVN ${next.reportHour}h sáng: ${next.enabled ? 'Đang bật' : 'Đang tắt'}.`, evnActionButtons(next));
+    });
+
     this.bot.on(message('text'), async (ctx, next) => {
       if (ctx.chat?.type !== 'private') return next();
       const text = String(ctx.message.text || '').trim();
@@ -1027,6 +1310,7 @@ class SharedTelegramRuntime {
         return showAccounts(ctx);
       }
       if (menuText === 'Quyền chat AI') return showAiUsers(ctx);
+      if (menuText === 'Tiền điện EVN') return showEvnPanel(ctx);
       if (menuText === 'Xóa lịch sử AI') {
         try {
           await this.manager?.clearAiHistory(ctx.from.id);
