@@ -20,30 +20,41 @@ test('EVNHANOI client logs in, fetches daily readings + debt, and computes 6-tie
   const requests = [];
   const fakeFetch = async (url, options = {}) => {
     requests.push({ url, method: options.method, body: options.body });
-    if (url.includes('apicskh.evnhanoi.com.vn/connect/token')) {
-      return new Response(JSON.stringify({ access_token: 'evn-token-123', expires_in: 3600 }), { status: 200 });
-    }
-    if (url.includes('LayChiSoDoXa')) {
-      const payload = JSON.parse(options.body);
-      assert.equal(payload.maDiemDo, 'PD01001234567001');
-      assert.equal(payload.maDonVi, 'PD0100');
+    if (url.includes('cskh.evn.com.vn/cskh/v1/auth/login')) {
       return new Response(JSON.stringify({
-        isError: false,
+        success: true,
         data: {
-          chiSoNgay: [
-            { ngay: '01/11/2026', sg: '1000.00' },
-            { ngay: '23/11/2026', sg: '1210.00' },
-            { ngay: '24/11/2026', sg: '1220.50' },
-            { ngay: '25/11/2026', sg: '1233.00' },
-          ],
+          accessToken: 'cskh-jwt-token',
+          data: {
+            maDviqly: 'HN0400',
+            maKhang: 'PD01001234567',
+            tenKhang: 'Nguyễn Văn A',
+            diaChi: 'Hà Nội',
+            maDviCaptct: 'HN',
+          },
         },
       }), { status: 200 });
     }
-    if (url.includes('GetListThongTinNoKhachHang')) {
+    if (url.includes('/api/evn/customers/diemdo')) {
       return new Response(JSON.stringify({
-        isError: false,
-        data: { listThongTinNoKhachHangVm: [] },
+        success: true,
+        data: [{ MA_KHANG: 'PD01001234567', MA_DDO: 'PD01001234567001' }],
       }), { status: 200 });
+    }
+    if (url.includes('/api/evn/tracuu/diennangngay')) {
+      const payload = JSON.parse(options.body);
+      assert.equal(payload.MA_DDO, 'PD01001234567001');
+      return new Response(JSON.stringify({
+        success: true,
+        data: [
+          { NGAY: '01/11/2026', NGAY_HTHI: '01/11/2026', CHI_SO: 1000.00, DIEN_TTHU: 210.00 },
+          { NGAY: '23/11/2026', NGAY_HTHI: '23/11/2026', CHI_SO: 1210.00, DIEN_TTHU: 10.50 },
+          { NGAY: '24/11/2026', NGAY_HTHI: '24/11/2026', CHI_SO: 1220.50, DIEN_TTHU: 12.50 },
+        ],
+      }), { status: 200 });
+    }
+    if (url.includes('/api/evn/tracuu/hoadon-thanhtoan')) {
+      return new Response(JSON.stringify({ success: true, data: [] }), { status: 200 });
     }
     throw new Error(`Unexpected URL: ${url}`);
   };

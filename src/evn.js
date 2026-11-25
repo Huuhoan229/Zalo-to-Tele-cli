@@ -1,5 +1,6 @@
-// EVN (EVNHANOI / EVNNPC) customer portal client, 6-tier residential tariff
-// calculator, report formatter, and Vietnam-time schedule helper.
+// EVN CSKH (cskh.evn.com.vn unified portal & mobile app + regional gateways)
+// client, 6-tier residential tariff calculator, report formatter, and Vietnam-time schedule helper.
+import crypto from 'node:crypto';
 
 export const EVN_RESIDENTIAL_TIERS = [
   { tier: 1, label: 'Bậc 1 (0-50 kWh)', min: 0, max: 50, price: 1984 },
@@ -12,7 +13,24 @@ export const EVN_RESIDENTIAL_TIERS = [
 
 export const EVN_VAT_PERCENT = 8;
 
-const EVNHANOI_LOGIN_URL = 'https://apicskh.evnhanoi.com.vn/connect/token';
+const CSKHEVN_BASE_URL = 'https://cskh.evn.com.vn/cskh/v1';
+const CSKHEVN_TCT_GATEWAYS = {
+  HN: 'https://gwkong.evnhanoi.vn',
+  PD: 'https://gwkong.evnhanoi.vn',
+  PA: 'https://apicskhevn.npc.com.vn',
+  NPC: 'https://apicskhevn.npc.com.vn',
+  PC: 'https://cskh-api.cpc.vn',
+  CPC: 'https://cskh-api.cpc.vn',
+  PB: 'https://api.cskh.evnspc.vn/api-cskh-evn',
+  SPC: 'https://api.cskh.evnspc.vn/api-cskh-evn',
+  PE: 'https://openapi.evnhcmc.vn/evn-ttcskh/appcskh',
+  HCM: 'https://openapi.evnhcmc.vn/evn-ttcskh/appcskh',
+};
+
+const EVNHANOI_LOGIN_URLS = [
+  'https://apicskh.evnhanoi.vn/connect/token',
+  'https://apicskh.evnhanoi.com.vn/connect/token',
+];
 const EVNHANOI_DATA_URL = 'https://evnhanoi.vn/api/TraCuu/LayChiSoDoXa';
 const EVNHANOI_PAYMENT_URL = 'https://evnhanoi.vn/api/TraCuu/GetListThongTinNoKhachHang';
 
@@ -26,7 +44,21 @@ const EVNNPC_BASIC_AUTH = Buffer.from(
 export function detectEvnArea(customerId) {
   const clean = String(customerId || '').trim().toUpperCase();
   if (/^(PA|PH|PM|PN)/.test(clean)) return 'EVNNPC';
+  if (/^(PC|PQ|PP)/.test(clean)) return 'EVNCPC';
+  if (/^PE/.test(clean)) return 'EVNHCMC';
+  if (/^(PB|PK)/.test(clean)) return 'EVNSPC';
   return 'EVNHANOI';
+}
+
+function gatewayForCustomer(customerId, maDviCaptct = '') {
+  const tct = String(maDviCaptct || '').trim().toUpperCase();
+  if (tct && CSKHEVN_TCT_GATEWAYS[tct]) return CSKHEVN_TCT_GATEWAYS[tct];
+  const area = detectEvnArea(customerId);
+  if (area === 'EVNNPC') return CSKHEVN_TCT_GATEWAYS.PA;
+  if (area === 'EVNCPC') return CSKHEVN_TCT_GATEWAYS.PC;
+  if (area === 'EVNHCMC') return CSKHEVN_TCT_GATEWAYS.PE;
+  if (area === 'EVNSPC') return CSKHEVN_TCT_GATEWAYS.PB;
+  return CSKHEVN_TCT_GATEWAYS.HN;
 }
 
 export function getVietnamDateParts(now = new Date()) {
@@ -127,36 +159,216 @@ function parseNumber(value) {
   return Number.isFinite(num) ? num : 0;
 }
 
-async function fetchEvnHanoi({ username, password, customerId, fromDate, toDate, fetchImpl = fetch, timeoutMs = 25000 }) {
-  const loginRes = await fetchImpl(EVNHANOI_LOGIN_URL, {
+/**
+ * Primary flow: Unified EVN CSKH application (https://cskh.evn.com.vn/cskh/v1/auth/login)
+ * + regional gateway (e.g. https://gwkong.evnhanoi.vn for EVNHANOI PD...).
+ */
+async function fetchUnifiedEvnCskh({
+  username,
+  password,
+  customerId,
+  fromDate,
+  toDate,
+  fetchImpl = fetch,
+  timeoutMs = 25000,
+}) {
+  const deviceId = crypto.randomUUID();
+  const loginRes = await fetchImpl(`${CSKHEVN_BASE_URL}/auth/login`, {
     method: 'POST',
     headers: {
-      'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Content-Type': 'application/json',
       'Accept': 'application/json',
-      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'X-deviceId': deviceId,
     },
-    body: new URLSearchParams({
-      username: String(username).trim(),
+    body: JSON.stringify({
+      deviceInfo: {
+        appId: 'CSKHEVN',
+        appVersion: 'v1.0.0',
+        deviceId,
+        deviceType: 'Windows-10/desktop/Chrome',
+        clientType: 'WEB',
+      },
+      email: 'admin@gmail.com',
+      expiration: 1000,
       password: String(password),
-      client_id: 'httplocalhost4500',
-      client_secret: 'secret',
-      grant_type: 'password',
+      username: String(username).trim(),
+      userid: String(username).trim(),
+      captchaToken: null,
     }),
     signal: AbortSignal.timeout(timeoutMs),
   });
 
-  let loginJson = null;
-  try {
-    loginJson = await loginRes.json();
-  } catch {
-    throw new Error(`Không đăng nhập được EVNHANOI (HTTP ${loginRes.status}).`);
+  const loginJson = await loginRes.json().catch(() => null);
+  const accessToken = loginJson?.data?.accessToken || loginJson?.accessToken;
+  if (!loginRes.ok || !loginJson?.success || !accessToken) {
+    const errMsg = loginJson?.message || loginJson?.cause || loginJson?.data || `HTTP ${loginRes.status}`;
+    throw Object.assign(new Error(`Đăng nhập EVN CSKH thất bại: ${errMsg}`), { authFailed: true });
   }
-  if (loginJson?.error === 'invalid_grant' || loginRes.status === 400 || loginRes.status === 401) {
-    throw new Error('Sai tài khoản hoặc mật khẩu EVNHANOI CSKH.');
+
+  let khachHang = loginJson?.data?.data || null;
+  let activeToken = accessToken;
+  const resolvedCustomerId = (customerId || khachHang?.maKhang || '').trim().toUpperCase();
+  if (!resolvedCustomerId) {
+    throw new Error('Tài khoản EVN CSKH chưa liên kết mã khách hàng nào.');
+  }
+
+  const headers = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Authorization': `Bearer ${activeToken}`,
+    'X-deviceId': deviceId,
+  };
+
+  // If user specified a different linked customerId than the default one in token, try switching context
+  if (khachHang?.maKhang && khachHang.maKhang.toUpperCase() !== resolvedCustomerId) {
+    try {
+      const switchRes = await fetchImpl(`${CSKHEVN_BASE_URL}/user/swich/${resolvedCustomerId}`, {
+        method: 'GET',
+        headers,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      const switchJson = await switchRes.json().catch(() => null);
+      const nextToken = switchJson?.data?.accessToken || switchJson?.accessToken;
+      if (nextToken) {
+        activeToken = nextToken;
+        headers.Authorization = `Bearer ${activeToken}`;
+      }
+      if (switchJson?.data?.data) khachHang = switchJson.data.data;
+    } catch {
+      // Continue with current token
+    }
+  }
+
+  const tctGateway = gatewayForCustomer(resolvedCustomerId, khachHang?.maDviCaptct);
+  let maDdo = `${resolvedCustomerId}001`;
+  try {
+    const diemDoRes = await fetchImpl(`${tctGateway}/api/evn/customers/diemdo`, {
+      method: 'GET',
+      headers,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const diemDoJson = await diemDoRes.json().catch(() => null);
+    const listDdo = Array.isArray(diemDoJson?.data) ? diemDoJson.data : [];
+    const matched = listDdo.find((d) => String(d?.MA_KHANG || '').toUpperCase() === resolvedCustomerId) || listDdo[0];
+    if (matched?.MA_DDO) maDdo = String(matched.MA_DDO);
+  } catch {
+    // Fallback to ${resolvedCustomerId}001
+  }
+
+  const dnRes = await fetchImpl(`${tctGateway}/api/evn/tracuu/diennangngay`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      MA_DDO: maDdo,
+      TU_NGAY: fromDate,
+      DEN_NGAY: toDate,
+    }),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const dnJson = await dnRes.json().catch(() => null);
+  const dailyList = Array.isArray(dnJson?.data) ? dnJson.data : [];
+  if (!dnJson?.success || dailyList.length === 0) {
+    throw new Error(`Chưa có dữ liệu điện năng ngày cho mã ${resolvedCustomerId} (${maDdo}) trong kỳ ${fromDate} - ${toDate}.`);
+  }
+
+  const first = dailyList[0];
+  const last = dailyList[dailyList.length - 1];
+  const prev = dailyList.length > 1 ? dailyList[dailyList.length - 2] : null;
+
+  const dailyLatestKwh = Math.max(0, Math.round(parseNumber(last?.DIEN_TTHU) * 100) / 100);
+  const dailyPreviousKwh = prev ? Math.max(0, Math.round(parseNumber(prev?.DIEN_TTHU) * 100) / 100) : 0;
+  const meterStart = Math.round(parseNumber(first?.CHI_SO) * 100) / 100;
+  const sumKwh = Math.round(dailyList.reduce((sum, item) => sum + Math.max(0, parseNumber(item?.DIEN_TTHU)), 0) * 100) / 100;
+  const lastBaseChiSo = parseNumber(last?.CHI_SO);
+  const meterLatest = lastBaseChiSo > 0
+    ? Math.round((lastBaseChiSo + dailyLatestKwh) * 100) / 100
+    : Math.round((meterStart + sumKwh) * 100) / 100;
+  const monthlyKwh = sumKwh > 0 ? sumKwh : Math.max(0, Math.round((meterLatest - meterStart) * 100) / 100);
+
+  const periodStartDate = String(first?.NGAY_HTHI || first?.NGAY || fromDate);
+  const latestUsageDate = String(last?.NGAY_HTHI || last?.NGAY || toDate);
+  const previousUsageDate = prev ? String(prev?.NGAY_HTHI || prev?.NGAY || '') : '';
+
+  let paymentStatus = 'Đã thanh toán';
+  let unpaidAmount = 0;
+  try {
+    const payRes = await fetchImpl(`${tctGateway}/api/evn/tracuu/hoadon-thanhtoan`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(null),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const payJson = await payRes.json().catch(() => null);
+    const bills = Array.isArray(payJson?.data) ? payJson.data : [];
+    const unpaid = bills.filter((b) => b?.TTRANG_TTOAN === 'CHUATT' || b?.TTRANG_TTOAN === 'TTOANMOTPHAN' || Number(b?.TONG_NO) > 0);
+    if (unpaid.length > 0) {
+      paymentStatus = 'Chưa thanh toán';
+      unpaidAmount = unpaid.reduce((sum, b) => sum + (parseNumber(b?.TONG_NO || b?.SO_TIEN) || 0), 0);
+    }
+  } catch {
+    // Non-fatal
+  }
+
+  return {
+    area: detectEvnArea(resolvedCustomerId),
+    customerId: resolvedCustomerId,
+    customerName: khachHang?.tenKhang || null,
+    customerAddress: khachHang?.diaChi || null,
+    fromDate: periodStartDate,
+    toDate: latestUsageDate,
+    latestReadingDate: latestUsageDate,
+    previousReadingDate: previousUsageDate,
+    meterStart,
+    meterLatest,
+    dailyLatestKwh,
+    dailyPreviousKwh,
+    monthlyKwh,
+    paymentStatus,
+    unpaidAmount,
+    readingCount: dailyList.length,
+  };
+}
+
+async function fetchLegacyEvnHanoi({ username, password, customerId, fromDate, toDate, fetchImpl = fetch, timeoutMs = 25000 }) {
+  let loginJson = null;
+  let lastStatus = 0;
+  for (const loginUrl of EVNHANOI_LOGIN_URLS) {
+    try {
+      const loginRes = await fetchImpl(loginUrl, {
+        method: 'POST',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'application/json',
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({
+          username: String(username).trim(),
+          password: String(password),
+          client_id: 'httplocalhost4500',
+          client_secret: 'secret',
+          grant_type: 'password',
+        }),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      lastStatus = loginRes.status;
+      loginJson = await loginRes.json();
+      if (loginJson?.access_token || loginJson?.error) break;
+    } catch {
+      // Try next login URL
+    }
+  }
+
+  if (!loginJson) {
+    throw new Error(`Không đăng nhập được EVNHANOI (HTTP ${lastStatus}).`);
+  }
+  if (loginJson?.error === 'invalid_grant' || lastStatus === 400 || lastStatus === 401) {
+    throw new Error(`Sai tài khoản hoặc mật khẩu EVNHANOI CSKH (${loginJson?.error_description || 'invalid_grant'}).`);
   }
   const accessToken = loginJson?.access_token;
   if (!accessToken) {
-    throw new Error(`EVNHANOI không trả về access_token (HTTP ${loginRes.status}).`);
+    throw new Error(`EVNHANOI không trả về access_token (HTTP ${lastStatus}).`);
   }
 
   const authHeaders = {
@@ -211,7 +423,6 @@ async function fetchEvnHanoi({ username, password, customerId, fromDate, toDate,
   const firstDateObj = parseDmyString(first?.ngay);
   const lastDateObj = parseDmyString(last?.ngay);
   const prevDateObj = parseDmyString(prev?.ngay);
-  // Each reading at 00:00 of day D represents usage through day (D - 1).
   const latestUsageDate = formatDmy(shiftDays(lastDateObj, -1)) || String(last?.ngay || toDate);
   const previousUsageDate = readings.length > 2
     ? (formatDmy(shiftDays(prevDateObj, -1)) || String(prev?.ngay || ''))
@@ -240,7 +451,7 @@ async function fetchEvnHanoi({ username, password, customerId, fromDate, toDate,
       }, 0);
     }
   } catch {
-    // Non-fatal if payment check fails.
+    // Non-fatal
   }
 
   return {
@@ -261,7 +472,7 @@ async function fetchEvnHanoi({ username, password, customerId, fromDate, toDate,
   };
 }
 
-async function fetchEvnNpc({ username, password, customerId, fromDate, toDate, fetchImpl = fetch, timeoutMs = 25000 }) {
+async function fetchLegacyEvnNpc({ username, password, customerId, fromDate, toDate, fetchImpl = fetch, timeoutMs = 25000 }) {
   const loginRes = await fetchImpl(EVNNPC_LOGIN_URL, {
     method: 'POST',
     headers: {
@@ -370,9 +581,27 @@ export async function fetchEvnUsage({
   }
   const { fromDate, toDate } = computeBillingRange(billingStartDay, now);
   const area = detectEvnArea(cleanCustomerId);
-  const raw = area === 'EVNNPC'
-    ? await fetchEvnNpc({ username: cleanUser, password: cleanPass, customerId: cleanCustomerId, fromDate, toDate, fetchImpl, timeoutMs })
-    : await fetchEvnHanoi({ username: cleanUser, password: cleanPass, customerId: cleanCustomerId, fromDate, toDate, fetchImpl, timeoutMs });
+
+  let raw;
+  try {
+    raw = await fetchUnifiedEvnCskh({
+      username: cleanUser,
+      password: cleanPass,
+      customerId: cleanCustomerId,
+      fromDate,
+      toDate,
+      fetchImpl,
+      timeoutMs,
+    });
+  } catch (unifiedError) {
+    try {
+      raw = area === 'EVNNPC'
+        ? await fetchLegacyEvnNpc({ username: cleanUser, password: cleanPass, customerId: cleanCustomerId, fromDate, toDate, fetchImpl, timeoutMs })
+        : await fetchLegacyEvnHanoi({ username: cleanUser, password: cleanPass, customerId: cleanCustomerId, fromDate, toDate, fetchImpl, timeoutMs });
+    } catch {
+      throw unifiedError;
+    }
+  }
 
   const monthlyCost = calcElectricityCost(raw.monthlyKwh);
   const prevMonthKwh = Math.max(0, raw.monthlyKwh - raw.dailyLatestKwh);
@@ -411,7 +640,8 @@ export function formatEvnReport(report) {
 
   return [
     `⚡ BÁO CÁO ĐIỆN NĂNG ${report.area || 'EVN'}`,
-    `Mã KH: ${report.customerId}`,
+    `Mã KH: ${report.customerId}${report.customerName ? ` (${report.customerName})` : ''}`,
+    ...(report.customerAddress ? [`Địa chỉ: ${report.customerAddress}`] : []),
     `Kỳ tính: ${report.fromDate} → ${report.toDate}`,
     '',
     `📅 Ngày gần nhất (${report.latestReadingDate}): ${report.dailyLatestKwh} kWh (~${formatVnd(report.dailyLatestCost)})${compareLine}`,
