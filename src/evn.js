@@ -571,7 +571,7 @@ export async function fetchEvnUsage({
   billingStartDay = 1,
   fetchImpl = fetch,
   now = new Date(),
-  timeoutMs = 25000,
+  timeoutMs = 12000,
 } = {}) {
   const cleanCustomerId = String(customerId || '').trim().toUpperCase();
   const cleanUser = String(username || '').trim();
@@ -594,6 +594,13 @@ export async function fetchEvnUsage({
       timeoutMs,
     });
   } catch (unifiedError) {
+    const isTimeout = unifiedError?.name === 'TimeoutError' || unifiedError?.name === 'AbortError' || /aborted|timeout/i.test(String(unifiedError?.message || ''));
+    if (isTimeout) {
+      throw new Error('Máy chủ Koyeb (IP quốc tế) kết nối tới EVN CSKH bị quá thời gian chờ (do EVN chặn IP ngoài Việt Nam).');
+    }
+    if (!unifiedError?.authFailed) {
+      throw unifiedError;
+    }
     try {
       raw = area === 'EVNNPC'
         ? await fetchLegacyEvnNpc({ username: cleanUser, password: cleanPass, customerId: cleanCustomerId, fromDate, toDate, fetchImpl, timeoutMs })

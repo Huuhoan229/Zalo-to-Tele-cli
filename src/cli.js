@@ -28,6 +28,38 @@ async function main() {
     accessToken: config.webAccessToken,
     logger,
     webhookHandlers,
+    onEvnProbe: async (sendToTelegram = false) => {
+      const cfg = await manager.getEvnConfig();
+      const configured = Boolean(cfg.username && cfg.password && cfg.customerId);
+      if (!configured) return { ok: false, configured: false, lastError: manager.lastEvnError || null };
+      try {
+        const { report, text } = await manager.fetchEvnReport();
+        let delivered = null;
+        if (sendToTelegram && telegramControl) {
+          delivered = await telegramControl.deliverEvnReport({
+            report,
+            text,
+            config: cfg,
+            destinations: { privateChat: true, forumTopic: false, zalo: false },
+          });
+        }
+        return {
+          ok: true,
+          configured: true,
+          area: report.area,
+          latestReadingDate: report.latestReadingDate,
+          dailyLatestKwh: report.dailyLatestKwh,
+          monthlyKwh: report.monthlyKwh,
+          delivered,
+        };
+      } catch (error) {
+        return {
+          ok: false,
+          configured: true,
+          error: String(error?.message || error).slice(0, 300),
+        };
+      }
+    },
     getQrPath: (accountId) => {
       const id = accountId || manager.getState().selectedAccountId;
       return id ? manager.getController(id)?.qrPath : null;

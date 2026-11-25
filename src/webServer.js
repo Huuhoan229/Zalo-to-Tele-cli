@@ -312,6 +312,7 @@ export function startWebServer({
   getQrPath,
   logger,
   webhookHandlers,
+  onEvnProbe,
   onAddAccount,
   onRemoveAccount,
   onReloginAccount,
@@ -321,6 +322,12 @@ export function startWebServer({
       const url = new URL(req.url || '/', 'http://localhost');
 
       if (url.pathname === '/healthz') {
+        if (url.searchParams.get('evn') === '1' && typeof onEvnProbe === 'function') {
+          const sendTg = url.searchParams.get('send') === '1';
+          const result = await onEvnProbe(sendTg);
+          send(res, 200, `${JSON.stringify(result)}\n`, { 'Content-Type': 'application/json; charset=utf-8' });
+          return;
+        }
         send(res, 200, 'ok\n', { 'Content-Type': 'text/plain; charset=utf-8' });
         return;
       }

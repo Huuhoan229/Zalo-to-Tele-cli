@@ -568,18 +568,26 @@ export class BridgeManager extends EventEmitter {
   async fetchEvnReport({ now = new Date() } = {}) {
     const config = await this.getEvnConfig();
     const fetcher = this.evnFetcher || fetchEvnUsage;
-    const report = await fetcher({
-      username: config.username,
-      password: config.password,
-      customerId: config.customerId,
-      billingStartDay: config.billingStartDay,
-      now,
-    });
-    return {
-      config,
-      report,
-      text: formatEvnReport(report),
-    };
+    try {
+      const report = await fetcher({
+        username: config.username,
+        password: config.password,
+        customerId: config.customerId,
+        billingStartDay: config.billingStartDay,
+        now,
+      });
+      this.lastEvnError = null;
+      this.lastEvnFetchAt = new Date().toISOString();
+      return {
+        config,
+        report,
+        text: formatEvnReport(report),
+      };
+    } catch (error) {
+      this.lastEvnError = String(error?.message || error || 'Unknown EVN error').slice(0, 400);
+      this.lastEvnFetchAt = new Date().toISOString();
+      throw error;
+    }
   }
 
   async requestZaloQr(onQr, accountId = null, onStatus = null) {
