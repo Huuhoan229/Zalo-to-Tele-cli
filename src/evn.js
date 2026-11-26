@@ -644,7 +644,9 @@ export function formatVnd(amount) {
   return `${num.toLocaleString('vi-VN').replace(/,/g, '.')} đ`;
 }
 
-export function formatEvnReport(report) {
+export function formatEvnReport(report, now = new Date()) {
+  const vnNow = getVietnamDateParts(now);
+  const yesterdayVn = formatDmy(shiftDays(new Date(Date.UTC(vnNow.year, vnNow.month - 1, vnNow.day)), -1));
   const diff = Math.round((report.dailyLatestKwh - (report.dailyPreviousKwh || 0)) * 100) / 100;
   const diffSign = diff > 0 ? `+${diff}` : `${diff}`;
   const compareLine = report.previousReadingDate
@@ -659,14 +661,17 @@ export function formatEvnReport(report) {
   const debtLine = report.unpaidAmount > 0 || report.paymentStatus === 'Chưa thanh toán'
     ? `⚠️ Chưa thanh toán (${formatVnd(report.unpaidAmount)})`
     : '✅ Đã thanh toán';
+  const dayLabel = report.latestReadingDate === yesterdayVn
+    ? `📅 Hôm qua (${report.latestReadingDate})`
+    : `📅 Ngày gần nhất (${report.latestReadingDate})`;
 
   return [
-    `⚡ BÁO CÁO ĐIỆN NĂNG ${report.area || 'EVN'}`,
+    `⚡ BÁO CÁO ĐIỆN NĂNG ${report.area || 'EVN'} (UTC+7: ${vnNow.dmyDate})`,
     `Mã KH: ${report.customerId}${report.customerName ? ` (${report.customerName})` : ''}`,
     ...(report.customerAddress ? [`Địa chỉ: ${report.customerAddress}`] : []),
     `Kỳ tính: ${report.fromDate} → ${report.toDate}`,
     '',
-    `📅 Ngày gần nhất (${report.latestReadingDate}): ${report.dailyLatestKwh} kWh (~${formatVnd(report.dailyLatestCost)})${compareLine}`,
+    `${dayLabel}: ${report.dailyLatestKwh} kWh (~${formatVnd(report.dailyLatestCost)})${compareLine}`,
     '',
     `📊 Tổng điện từ đầu kỳ: ${report.monthlyKwh} kWh`,
     `🔢 Chỉ số công tơ: ${report.meterStart} → ${report.meterLatest} kWh`,

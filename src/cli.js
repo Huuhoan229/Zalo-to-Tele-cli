@@ -3,6 +3,7 @@ import { config } from './config.js';
 import { BridgeManager } from './bridgeManager.js';
 import { startWebServer } from './webServer.js';
 import { webhookHandlers, startTelegramControlBot, stopTelegramControlBot } from './telegramBot.js';
+import { formatEvnReport } from './evn.js';
 
 const logger = pino({
   level: config.logLevel,
@@ -41,7 +42,10 @@ async function main() {
       const configured = Boolean((nextCfg.username && nextCfg.password && nextCfg.customerId) || nextCfg.cachedReport);
       if (!configured) return { ok: false, configured: false, lastError: manager.lastEvnError || null };
       try {
-        const { report, text, fromCache } = await manager.fetchEvnReport();
+        const fetched = pushedReport && pushedReport.customerId
+          ? { report: pushedReport, text: formatEvnReport(pushedReport), fromCache: false }
+          : await manager.fetchEvnReport();
+        const { report, text, fromCache } = fetched;
         let weatherText = null;
         if (nextCfg.weatherEnabled !== false && typeof manager.fetchWeatherReport === 'function') {
           try {
