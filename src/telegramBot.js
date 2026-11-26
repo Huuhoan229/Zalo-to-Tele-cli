@@ -599,15 +599,15 @@ class SharedTelegramRuntime {
       if (config.lastReportDate === vn.isoDate) {
         return { skipped: 'already-sent-today', date: vn.isoDate };
       }
-      const { report, text } = await this.manager.fetchEvnReport({ now });
+      const { report, text, fromCache } = await this.manager.fetchEvnReport({ now });
       if (
-        vn.hour < reportHour + 2 &&
+        (fromCache || vn.hour < reportHour + 2) &&
         config.lastReportedReadingDate &&
         report.latestReadingDate === config.lastReportedReadingDate
       ) {
         this.logger.info(
-          { latestReadingDate: report.latestReadingDate },
-          'EVN has not published a newer daily reading yet; waiting for next morning check.',
+          { latestReadingDate: report.latestReadingDate, fromCache: Boolean(fromCache) },
+          'EVN has not published a newer daily reading yet; waiting for next check or sync.',
         );
         return { skipped: 'waiting-new-reading', latestReadingDate: report.latestReadingDate };
       }

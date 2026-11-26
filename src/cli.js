@@ -3,7 +3,7 @@ import { config } from './config.js';
 import { BridgeManager } from './bridgeManager.js';
 import { startWebServer } from './webServer.js';
 import { webhookHandlers, startTelegramControlBot, stopTelegramControlBot } from './telegramBot.js';
-import { formatEvnReport } from './evn.js';
+import { formatEvnReport, getVietnamDateParts } from './evn.js';
 
 const logger = pino({
   level: config.logLevel,
@@ -56,13 +56,32 @@ async function main() {
           }
         }
         let delivered = null;
-        if (sendToTelegram && telegramControl) {
+        const vn = getVietnamDateParts();
+        const reportHour = Number.isFinite(Number(nextCfg.reportHour)) ? Number(nextCfg.reportHour) : 6;
+        const isNewDailyReadingAfterReportHour = Boolean(
+          pushedReport &&
+          nextCfg.enabled !== false &&
+          vn.hour >= reportHour &&
+          pushedReport.latestReadingDate &&
+          cfg.lastReportedReadingDate &&
+          cfg.lastReportedReadingDate !== pushedReport.latestReadingDate &&
+          cfg.lastReportDate !== vn.isoDate,
+        );
+        if ((sendToTelegram || isNewDailyReadingAfterReportHour) && telegramControl) {
           delivered = await telegramControl.deliverEvnReport({
             report,
             text,
             weatherText,
             config: nextCfg,
             destinations: { privateChat: true, forumTopic: true, zalo: true },
+          });
+          await manager.updateEvnConfig({
+            lastReportDate: vn.isoDate,
+            lastReportedReadingDate: report.latestReadingDate,
+          });
+        } else if (pushedReport && pushedReport.latestReadingDate && !cfg.lastReportedReadingDate) {
+          await manager.updateEvnConfig({
+            lastReportedReadingDate: pushedReport.latestReadingDate,
           });
         }
         return {
