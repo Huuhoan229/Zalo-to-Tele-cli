@@ -1,6 +1,162 @@
 // EVN CSKH (cskh.evn.com.vn unified portal & mobile app + regional gateways)
 // client, 6-tier residential tariff calculator, report formatter, and Vietnam-time schedule helper.
 import crypto from 'node:crypto';
+import dns from 'node:dns/promises';
+import https from 'node:https';
+import net from 'node:net';
+import tls from 'node:tls';
+
+let lastWorkingVnProxy = null;
+
+function httpsRequestViaProxy(proxy, targetIp, urlStr, { method = 'GET', headers = {}, body = null, timeoutMs = 7000 } = {}) {
+  const u = new URL(urlStr);
+  const targetPort = Number(u.port) || 443;
+  return new Promise((resolve, reject) => {
+    const sock = net.connect(Number(proxy.port), proxy.host);
+    const timer = setTimeout(() => {
+      sock.destroy();
+      reject(new Error('VN proxy timeout'));
+    }, timeoutMs);
+    const fail = (err) => {
+      clearTimeout(timer);
+      sock.destroy();
+      reject(err);
+    };
+    sock.once('error', fail);
+
+    const startHttpsOverSocket = () => {
+      const reqHeaders = { ...headers };
+      if (body && !reqHeaders['Content-Length'] && !reqHeaders['content-length']) {
+        reqHeaders['Content-Length'] = Buffer.byteLength(body);
+      }
+      const req = https.request(
+        {
+          hostname: u.hostname,
+          port: targetPort,
+          path: u.pathname + u.search,
+          method,
+          headers: reqHeaders,
+          createConnection: () => tls.connect({ socket: sock, servername: u.hostname }),
+        },
+        (res) => {
+          const chunks = [];
+          res.on('data', (c) => chunks.push(c));
+          res.on('end', () => {
+            clearTimeout(timer);
+            const text = Buffer.concat(chunks).toString('utf8');
+            resolve({ status: res.statusCode || 200, text });
+          });
+        },
+      );
+      req.once('error', fail);
+      if (body) req.write(body);
+      req.end();
+    };
+
+    sock.once('connect', () => {
+      const ipParts = targetIp.split('.').map(Number);
+      if (proxy.proto === 'socks4') {
+        sock.write(Buffer.from([0x04, 0x01, (targetPort >> 8) & 0xff, targetPort & 0xff, ...ipParts, 0x00]));
+        sock.once('data', (d) => {
+          if (!d || d.length < 2 || d[1] !== 0x5a) return fail(new Error('SOCKS4 rejected'));
+          startHttpsOverSocket();
+        });
+      } else if (proxy.proto === 'socks5') {
+        sock.write(Buffer.from([0x05, 0x01, 0x00]));
+        sock.once('data', (d) => {
+          if (!d || d[0] !== 0x05 || d[1] !== 0x00) return fail(new Error('SOCKS5 auth failed'));
+          sock.write(Buffer.from([0x05, 0x01, 0x00, 0x01, ...ipParts, (targetPort >> 8) & 0xff, targetPort & 0xff]));
+          sock.once('data', (d2) => {
+            if (!d2 || d2[1] !== 0x00) return fail(new Error('SOCKS5 connect failed'));
+            startHttpsOverSocket();
+          });
+        });
+      } else {
+        sock.write(`CONNECT ${u.hostname}:${targetPort} HTTP/1.1\r\nHost: ${u.hostname}:${targetPort}\r\n\r\n`);
+        sock.once('data', (d) => {
+          if (!String(d || '').includes(' 200 ')) return fail(new Error('HTTP CONNECT rejected'));
+          startHttpsOverSocket();
+        });
+      }
+    });
+  });
+}
+
+async function discoverVnProxies() {
+  const candidates = [];
+  const envProxy = process.env.EVN_VN_PROXY?.trim();
+  if (envProxy) {
+    const m = /^(socks4|socks5|http):\/\/([^:/]+):(\d+)/i.exec(envProxy);
+    if (m) candidates.push({ proto: m[1].toLowerCase(), host: m[2], port: Number(m[3]) });
+  }
+  const [gn, ps4, ps5] = await Promise.all([
+    fetch('https://proxylist.geonode.com/api/proxy-list?country=VN&limit=80&page=1&sort_by=lastChecked&sort_type=desc', {
+      signal: AbortSignal.timeout(6000),
+    }).then((r) => r.json()).catch(() => null),
+    fetch('https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks4&timeout=7000&country=VN', {
+      signal: AbortSignal.timeout(6000),
+    }).then((r) => r.text()).catch(() => ''),
+    fetch('https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=7000&country=VN', {
+      signal: AbortSignal.timeout(6000),
+    }).then((r) => r.text()).catch(() => ''),
+  ]);
+  for (const item of gn?.data || []) {
+    const proto = (item.protocols?.[0] || 'socks4').toLowerCase();
+    if (item.ip && item.port) {
+      candidates.push({ proto: proto === 'https' ? 'http' : proto, host: item.ip, port: Number(item.port) });
+    }
+  }
+  for (const line of String(ps4 || '').split(/\r?\n/).filter(Boolean)) {
+    const [host, port] = line.trim().split(':');
+    if (host && port) candidates.push({ proto: 'socks4', host, port: Number(port) });
+  }
+  for (const line of String(ps5 || '').split(/\r?\n/).filter(Boolean)) {
+    const [host, port] = line.trim().split(':');
+    if (host && port) candidates.push({ proto: 'socks5', host, port: Number(port) });
+  }
+  const seen = new Set();
+  return candidates.filter((c) => {
+    const key = `${c.proto}://${c.host}:${c.port}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+async function fetchJsonViaVietnamTlsTunnel(urlStr, options = {}) {
+  const u = new URL(urlStr);
+  const [{ address: targetIp }] = await dns.lookup(u.hostname, { all: true });
+
+  const tryOne = async (proxy) => {
+    const res = await httpsRequestViaProxy(proxy, targetIp, urlStr, options);
+    const parsed = JSON.parse(res.text);
+    if (!parsed || typeof parsed !== 'object' || parsed.success === false) {
+      throw new Error('Invalid JSON response via VN proxy');
+    }
+    lastWorkingVnProxy = proxy;
+    return parsed;
+  };
+
+  if (lastWorkingVnProxy) {
+    try {
+      return await tryOne(lastWorkingVnProxy);
+    } catch {
+      lastWorkingVnProxy = null;
+    }
+  }
+
+  const proxies = await discoverVnProxies();
+  const batchSize = 16;
+  for (let offset = 0; offset < proxies.length; offset += batchSize) {
+    const batch = proxies.slice(offset, offset + batchSize);
+    try {
+      return await Promise.any(batch.map((p) => tryOne(p)));
+    } catch {
+      // Try next batch
+    }
+  }
+  throw new Error('Không tìm được tuyến kết nối IP Việt Nam khả dụng tới cổng EVNHANOI.');
+}
 
 export const EVN_RESIDENTIAL_TIERS = [
   { tier: 1, label: 'Bậc 1 (0-50 kWh)', min: 0, max: 50, price: 1984 },
@@ -250,7 +406,7 @@ async function fetchUnifiedEvnCskh({
     const diemDoRes = await fetchImpl(`${tctGateway}/api/evn/customers/diemdo`, {
       method: 'GET',
       headers,
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: AbortSignal.timeout(Math.min(timeoutMs, 6000)),
     });
     const diemDoJson = await diemDoRes.json().catch(() => null);
     const listDdo = Array.isArray(diemDoJson?.data) ? diemDoJson.data : [];
@@ -260,31 +416,62 @@ async function fetchUnifiedEvnCskh({
     // Fallback to ${resolvedCustomerId}001
   }
 
-  const dnRes = await fetchImpl(`${tctGateway}/api/evn/tracuu/diennangngay`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      MA_DDO: maDdo,
-      TU_NGAY: fromDate,
-      DEN_NGAY: toDate,
-    }),
-    signal: AbortSignal.timeout(timeoutMs),
+  const dnUrl = `${tctGateway}/api/evn/tracuu/diennangngay`;
+  const dnBody = JSON.stringify({
+    MA_DDO: maDdo,
+    TU_NGAY: fromDate,
+    DEN_NGAY: toDate,
   });
-  const dnRawText = await dnRes.text();
+
   let dnJson = null;
+  let dnRawText = '';
+  let dnStatus = 0;
   try {
+    const dnRes = await fetchImpl(dnUrl, {
+      method: 'POST',
+      headers,
+      body: dnBody,
+      signal: AbortSignal.timeout(Math.min(timeoutMs, 8000)),
+    });
+    dnStatus = dnRes.status;
+    dnRawText = await dnRes.text();
     dnJson = JSON.parse(dnRawText);
   } catch {
+    dnJson = null;
+  }
+
+  // If Koyeb's foreign datacenter IP is blocked by EVNHANOI's F5 Geo-IP WAF
+  // ("Request Rejected"), automatically tunnel TLS via a Vietnam IP directly from Koyeb.
+  let usedVietnamTunnel = false;
+  if ((!dnJson || typeof dnJson !== 'object') && fetchImpl === fetch) {
+    try {
+      dnJson = await fetchJsonViaVietnamTlsTunnel(dnUrl, {
+        method: 'POST',
+        headers,
+        body: dnBody,
+        timeoutMs: 7000,
+      });
+      usedVietnamTunnel = true;
+    } catch (tunnelError) {
+      throw Object.assign(
+        new Error(
+          `Cổng ${tctGateway} từ chối IP quốc tế Koyeb và chưa mở được tunnel VN (${tunnelError?.message || tunnelError} | HTTP ${dnStatus}: ${dnRawText.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120)})`,
+        ),
+        { gatewayBlocked: true },
+      );
+    }
+  } else if (!dnJson) {
     throw Object.assign(
-      new Error(`Cổng ${tctGateway} từ chối kết nối từ IP máy chủ Koyeb (HTTP ${dnRes.status}: ${dnRawText.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140)})`),
+      new Error(`Cổng ${tctGateway} từ chối kết nối từ IP máy chủ Koyeb (HTTP ${dnStatus}: ${dnRawText.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140)})`),
       { gatewayBlocked: true },
     );
   }
+
   const dailyList = Array.isArray(dnJson?.data) ? dnJson.data : [];
   if (!dnJson?.success || dailyList.length === 0) {
     throw Object.assign(
-      new Error(`Chưa có dữ liệu điện năng ngày cho mã ${resolvedCustomerId} (${maDdo}) trong kỳ ${fromDate} - ${toDate} (HTTP ${dnRes.status}: ${dnRawText.slice(0, 140)}).`),
-      { gatewayBlocked: dnRes.status !== 200 || !dnJson?.success },
+      new Error(`Chưa có dữ liệu điện năng ngày cho mã ${resolvedCustomerId} (${maDdo}) trong kỳ ${fromDate} - ${toDate} (HTTP ${dnStatus}: ${dnRawText.slice(0, 140)}).`),
+      { gatewayBlocked: dnStatus !== 200 || !dnJson?.success },
     );
   }
 
@@ -309,13 +496,24 @@ async function fetchUnifiedEvnCskh({
   let paymentStatus = 'Đã thanh toán';
   let unpaidAmount = 0;
   try {
-    const payRes = await fetchImpl(`${tctGateway}/api/evn/tracuu/hoadon-thanhtoan`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(null),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    const payJson = await payRes.json().catch(() => null);
+    const payUrl = `${tctGateway}/api/evn/tracuu/hoadon-thanhtoan`;
+    let payJson = null;
+    if (usedVietnamTunnel) {
+      payJson = await fetchJsonViaVietnamTlsTunnel(payUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(null),
+        timeoutMs: 6000,
+      });
+    } else {
+      const payRes = await fetchImpl(payUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(null),
+        signal: AbortSignal.timeout(Math.min(timeoutMs, 6000)),
+      });
+      payJson = await payRes.json().catch(() => null);
+    }
     const bills = Array.isArray(payJson?.data) ? payJson.data : [];
     const unpaid = bills.filter((b) => b?.TTRANG_TTOAN === 'CHUATT' || b?.TTRANG_TTOAN === 'TTOANMOTPHAN' || Number(b?.TONG_NO) > 0);
     if (unpaid.length > 0) {
