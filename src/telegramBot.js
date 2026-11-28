@@ -2703,6 +2703,7 @@ export class TelegramBridgeBot {
     const send = (action) => this.runtime.groupQueue.run(chatId, action, this.forwardingAbort.signal);
     const reactorName = await this.resolveReactionSenderName(reactionEvent, mapping);
     const reactorKey = String(reactionEvent.uidFrom || reactorName || 'zalo');
+    this.reactionLocks ||= new Map();
 
     for (const target of reactionEvent.targets || []) {
       const entry = this.store.findMessageByZaloId?.(reactionEvent.conversationId, target);
@@ -2710,62 +2711,108 @@ export class TelegramBridgeBot {
       const echoKey = `${reactionEvent.conversationId}:${entry.replyData?.msgId ?? entry.id}`;
       const echoExpiry = this.pendingReactionEchoes?.get(echoKey) || 0;
       if (reactionEvent.isSelf && echoExpiry >= Date.now()) {
-        this.pendingReactionEchoes.delete(echoKey);
+        // Do not delete echoKey immediately: Zalo may emit multiple echo packets for one reaction.
         continue;
       }
-      await send(() => this.bot.telegram.callApi('setMessageReaction', {
-        chat_id: chatId,
-        message_id: entry.telegramMessageId,
-        reaction: emoji ? [{ type: 'emoji', emoji }] : [],
-      })).catch((error) => {
-        this.logger.warn({ error: humanError(error), messageId: entry.telegramMessageId }, 'Could not set Telegram message reaction.');
+
+      const lockKey = `${chatId}:${entry.telegramMessageId}`;
+      const prevLock = this.reactionLocks.get(lockKey) || Promise.resolve();
+      const nextLock = prevLock.then(async () => {
+        if (entry.lastTelegramEmoji !== emoji) {
+          entry.lastTelegramEmoji = emoji;
+          await send(() => this.bot.telegram.callApi('setMessageReaction', {
+            chat_id: chatId,
+            message_id: entry.telegramMessageId,
+            reaction: emoji ? [{ type: 'emoji', emoji }] : [],
+          })).catch((error) => {
+            this.logger.warn({ error: humanError(error), messageId: entry.telegramMessageId }, 'Could not set Telegram message reaction.');
+          });
+        }
+
+        entry.zaloReactions ||= {};
+        if (!emoji) {
+          delete entry.zaloReactions[reactorKey];
+        } else {
+          const current = entry.zaloReactions[reactorKey] || { name: reactorName, emojis: [] };
+          current.name = reactorName;
+          if (!current.emojis.includes(emoji)) {
+            current.emojis = [...current.emojis, emoji].slice(-8);
+          }
+          entry.zaloReactions[reactorKey] = current;
+        }
+
+        const activeReactors = Object.values(entry.zaloReactions).filter((r) => Array.isArray(r?.emojis) && r.emojis.length > 0);
+        const summaryLine = activeReactors.length > 0
+          ? `🎭 ${activeReactors.map((r) => `${r.name}: ${r.emojis.join(' ')}`).join(' · ')}`
+          : '';
+
+        if (entry.lastReactionSummaryText === summaryLine) {
+          return;
+        }
+        entry.lastReactionSummaryText = summaryLine;
+
+        // 1. If the message bubble on Telegram was sent by the bot itself (forwarded from Zalo),
+        // edit the bubble directly to append the reaction footer -> 0 extra reply bubbles!
+        if (entry.source !== 'telegram' && !entry.attachment && typeof this.bot.telegram.editMessageText === 'function') {
+          const header = mapping.threadType === 1
+            ? `[${entry.senderName || 'Zalo'}]`
+            : `[${mapping.title || entry.senderName || 'Zalo'}]`;
+          const baseText = `${header}\n${entry.text || ''}`;
+          const nextBubbleText = summaryLine ? `${baseText}\n\n${summaryLine}` : baseText;
+          const editedInPlace = await send(() => this.bot.telegram.editMessageText(
+            chatId,
+            entry.telegramMessageId,
+            undefined,
+            nextBubbleText.slice(0, 4096),
+          )).then(() => true).catch((err) => /message is not modified/i.test(humanError(err)));
+          if (editedInPlace) {
+            await this.store.save?.().catch(() => {});
+            return;
+          }
+        }
+
+        if (!summaryLine) return;
+        // If only "[Tôi]" reacted to an outgoing Telegram message, the native emoji badge on the bubble is enough.
+        if (activeReactors.length === 1 && activeReactors[0].name === 'Tôi') {
+          await this.store.save?.().catch(() => {});
+          return;
+        }
+
+        // 2. For messages sent by the user on Telegram (or attachments), maintain at most 1 edited notice message.
+        if (entry.reactionNoticeMessageId && typeof this.bot.telegram.editMessageText === 'function') {
+          let noticeMissing = false;
+          await send(() => this.bot.telegram.editMessageText(
+            chatId,
+            entry.reactionNoticeMessageId,
+            undefined,
+            summaryLine,
+          )).catch((err) => {
+            if (/message to edit not found|MESSAGE_ID_INVALID/i.test(humanError(err))) {
+              noticeMissing = true;
+            }
+          });
+          if (!noticeMissing) {
+            await this.store.save?.().catch(() => {});
+            return;
+          }
+          entry.reactionNoticeMessageId = null;
+        }
+
+        if (typeof this.bot.telegram.sendMessage === 'function') {
+          const notice = await send(() => this.bot.telegram.sendMessage(chatId, summaryLine, {
+            message_thread_id: mapping.topicId,
+            reply_to_message_id: entry.telegramMessageId,
+          })).catch(() => null);
+          if (notice?.message_id) {
+            entry.reactionNoticeMessageId = notice.message_id;
+            await this.store.save?.().catch(() => {});
+          }
+        }
+      }).catch((err) => {
+        this.logger.warn({ error: humanError(err) }, 'Could not update Zalo reaction display.');
       });
-
-      entry.zaloReactions ||= {};
-      if (!emoji) {
-        delete entry.zaloReactions[reactorKey];
-      } else {
-        const current = entry.zaloReactions[reactorKey] || { name: reactorName, emojis: [] };
-        current.name = reactorName;
-        if (!current.emojis.includes(emoji)) {
-          current.emojis = [...current.emojis, emoji].slice(-8);
-        }
-        entry.zaloReactions[reactorKey] = current;
-      }
-
-      const activeReactors = Object.values(entry.zaloReactions).filter((r) => Array.isArray(r?.emojis) && r.emojis.length > 0);
-      if (activeReactors.length === 0) continue;
-
-      const summaryText = activeReactors.length === 1
-        ? `🎭 [${activeReactors[0].name}] đã bày tỏ cảm xúc: ${activeReactors[0].emojis.join(' ')}`
-        : [
-            '🎭 Cảm xúc trên Zalo:',
-            ...activeReactors.map((r) => `• ${r.name}: ${r.emojis.join(' ')}`),
-          ].join('\n');
-
-      if (entry.reactionNoticeMessageId && typeof this.bot.telegram.editMessageText === 'function') {
-        const edited = await send(() => this.bot.telegram.editMessageText(
-          chatId,
-          entry.reactionNoticeMessageId,
-          undefined,
-          summaryText,
-        )).then(() => true).catch(() => false);
-        if (edited) {
-          await this.store.save?.().catch(() => {});
-          continue;
-        }
-      }
-
-      if (typeof this.bot.telegram.sendMessage === 'function') {
-        const notice = await send(() => this.bot.telegram.sendMessage(chatId, summaryText, {
-          message_thread_id: mapping.topicId,
-          reply_to_message_id: entry.telegramMessageId,
-        })).catch(() => null);
-        if (notice?.message_id) {
-          entry.reactionNoticeMessageId = notice.message_id;
-          await this.store.save?.().catch(() => {});
-        }
-      }
+      this.reactionLocks.set(lockKey, nextLock);
+      await nextLock;
     }
   }
 
