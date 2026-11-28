@@ -16,10 +16,111 @@ function isRecoverableQrLoginError(error) {
   );
 }
 
-function pickText(content) {
-  if (typeof content === 'string') return content;
-  if (!content || typeof content !== 'object') return '';
-  return content.title || content.href || content.description || content.text || '';
+function formatCallDuration(secondsInput) {
+  let seconds = Math.round(Number(secondsInput) || 0);
+  if (seconds > 36000) seconds = Math.round(seconds / 1000);
+  if (seconds <= 0) return '';
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  if (mins > 0 && secs > 0) return `${mins} phút ${secs} giây`;
+  if (mins > 0) return `${mins} phút`;
+  return `${secs} giây`;
+}
+
+export function pickText(content, messageData = null, isSelf = false) {
+  if (typeof content === 'string') {
+    const trimmed = content.trim();
+    if (!trimmed.startsWith('{')) return trimmed;
+    const parsed = parseObject(trimmed);
+    if (!parsed) return trimmed;
+    content = parsed;
+  }
+  const obj = parseObject(content) || {};
+  const params = parseObject(obj.params) || parseObject(obj.item) || {};
+  const msgType = String(messageData?.msgType || obj.msgType || '').toLowerCase();
+  const action = String(obj.action || params.action || '').toLowerCase();
+  const subType = String(obj.type || params.type || '').toLowerCase();
+  const titleAndDesc = `${obj.title || ''} ${obj.description || ''} ${params.title || ''} ${params.description || ''} ${messageData?.notify || ''}`.trim();
+
+  const isCall =
+    /call|voip/.test(msgType) ||
+    /call|voip/.test(action) ||
+    /call|voip/.test(subType) ||
+    obj.callId !== undefined ||
+    obj.call_id !== undefined ||
+    params.callId !== undefined ||
+    params.call_id !== undefined ||
+    params.calltype !== undefined ||
+    params.callType !== undefined ||
+    /cuộc gọi|gọi nhỡ|gọi thoại|gọi video|missed call|video call|voice call/i.test(titleAndDesc);
+
+  if (isCall) {
+    const isVideo = Boolean(
+      obj.isVideo ||
+      params.isVideo ||
+      obj.video ||
+      params.video ||
+      Number(obj.callType ?? params.callType ?? params.calltype) === 2 ||
+      /video/i.test(`${msgType} ${action} ${subType} ${titleAndDesc}`),
+    );
+    const durationSec = Number(
+      params.duration ?? obj.duration ?? params.callDuration ?? obj.callDuration ?? 0,
+    );
+    const durationLabel = formatCallDuration(durationSec);
+    if (durationLabel) {
+      return `${isVideo ? '📹 Cuộc gọi video Zalo' : '📞 Cuộc gọi thoại Zalo'} (${durationLabel})`;
+    }
+    if (isSelf) {
+      return isVideo
+        ? '📹 Bạn đã gọi video trên Zalo (không bắt máy)'
+        : '📞 Bạn đã gọi trên Zalo (không bắt máy)';
+    }
+    return isVideo
+      ? '📹 Cuộc gọi video nhỡ trên Zalo'
+      : '📞 Cuộc gọi nhỡ trên Zalo';
+  }
+
+  if (/location/.test(msgType) || (params.lat !== undefined && (params.lon !== undefined || params.lng !== undefined))) {
+    const lat = params.lat ?? obj.lat;
+    const lon = params.lon ?? params.lng ?? obj.lon ?? obj.lng;
+    const address = obj.title || obj.description || params.address || params.name || '';
+    const mapLink = lat && lon ? `\nhttps://maps.google.com/?q=${lat},${lon}` : '';
+    return `📍 Đã chia sẻ vị trí${address ? `: ${address}` : ''}${mapLink}`;
+  }
+
+  if (/poll/.test(msgType) || /poll/.test(action)) {
+    const q = obj.title || params.question || obj.description || '';
+    return `📊 Bình chọn trong nhóm${q ? `: ${q}` : ''}`;
+  }
+
+  if (/todo/.test(msgType) || /todo|reminder/.test(action)) {
+    const item = parseObject(params.item);
+    const todoText = item?.content || params.content || obj.title || obj.description || '';
+    return `📅 Nhắc hẹn / Công việc${todoText ? `: ${todoText}` : ''}`;
+  }
+
+  if (/recommened\.user|vcard|contact/.test(`${msgType} ${action}`)) {
+    const name = obj.title || params.displayName || params.name || obj.description || '';
+    const phone = params.phone || params.phoneNumber || '';
+    return `👤 Đã gửi danh thiếp Zalo${name ? `: ${name}` : ''}${phone ? ` (${phone})` : ''}`;
+  }
+
+  if (/doodle/.test(msgType)) return '🎨 Hình vẽ tay trên Zalo';
+  if (/ecard/.test(msgType)) return '🎉 Thiệp chúc mừng trên Zalo';
+
+  const direct =
+    obj.title ||
+    obj.href ||
+    obj.description ||
+    obj.text ||
+    obj.msg ||
+    params.title ||
+    params.description ||
+    params.text ||
+    params.msg ||
+    messageData?.notify ||
+    '';
+  return String(direct || '').trim();
 }
 
 function pickSenderName(message) {
@@ -572,7 +673,7 @@ export class ZaloClient extends EventEmitter {
       mentionsAll,
       senderName: isSelf ? 'Tôi' : pickSenderName(message),
       title: await this.resolveConversationTitle(message, isGroup, isSelf),
-      text: attachment?.type === 'sticker' ? '' : pickText(content),
+      text: attachment?.type === 'sticker' ? '' : pickText(content, message.data, isSelf),
       replyTo: message.data?.quote
         ? {
             senderName: message.data.quote.fromD || message.data.quote.dName || message.data.quote.senderName || '',

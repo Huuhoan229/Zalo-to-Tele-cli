@@ -225,7 +225,10 @@ function formatZaloMessage(zaloMessage) {
         : zaloMessage.attachment?.type === 'video'
           ? '🎬 Video'
           : zaloMessage.attachment?.title;
-  const body = zaloMessage.text || defaultAttachmentLabel || '(non-text message)';
+  const fallbackCallLabel = zaloMessage.isSelf
+    ? '📞 Bạn đã gọi trên Zalo (không bắt máy)'
+    : '📞 Cuộc gọi nhỡ trên Zalo';
+  const body = zaloMessage.text || defaultAttachmentLabel || fallbackCallLabel;
   return `${prefix}\n${quoted}${body}`;
 }
 

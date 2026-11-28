@@ -13,7 +13,7 @@ import {
 } from '../src/telegramBot.js';
 import { TelegramGroupQueue } from '../src/telegramGroupQueue.js';
 import { Store } from '../src/store.js';
-import { ZaloClient, buildZaloMentions } from '../src/zaloClient.js';
+import { ZaloClient, buildZaloMentions, pickText } from '../src/zaloClient.js';
 
 const noWait = async () => {};
 const logger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
@@ -297,4 +297,21 @@ test('ZaloClient normalizes voice/video attachments, undo events, and reaction m
   const m2 = buildZaloMentions('@ kiểm tra giúp nhé', members, { uid: 'u200', name: 'Trần Thu Hà' });
   assert.equal(m2.text, '@Trần Thu Hà kiểm tra giúp nhé');
   assert.deepEqual(m2.mentions, [{ pos: 0, len: 12, uid: 'u200' }]);
+
+  assert.equal(
+    pickText({ action: 'recommened.call', params: JSON.stringify({ isVideo: 0, duration: 0 }) }, { msgType: 'chat.recommended' }, false),
+    '📞 Cuộc gọi nhỡ trên Zalo',
+  );
+  assert.equal(
+    pickText({ action: 'recommened.call', params: JSON.stringify({ isVideo: 1, duration: 0 }) }, { msgType: 'chat.recommended' }, false),
+    '📹 Cuộc gọi video nhỡ trên Zalo',
+  );
+  assert.equal(
+    pickText({ action: 'recommened.call', params: JSON.stringify({ isVideo: 0, duration: 85 }) }, { msgType: 'chat.recommended' }, false),
+    '📞 Cuộc gọi thoại Zalo (1 phút 25 giây)',
+  );
+  assert.match(
+    pickText({ title: 'Hồ Hoàn Kiếm', params: JSON.stringify({ lat: 21.0285, lon: 105.8542 }) }, { msgType: 'chat.location.new' }, false),
+    /📍 Đã chia sẻ vị trí: Hồ Hoàn Kiếm/,
+  );
 });
