@@ -13,7 +13,7 @@ import {
 } from '../src/telegramBot.js';
 import { TelegramGroupQueue } from '../src/telegramGroupQueue.js';
 import { Store } from '../src/store.js';
-import { ZaloClient } from '../src/zaloClient.js';
+import { ZaloClient, buildZaloMentions } from '../src/zaloClient.js';
 
 const noWait = async () => {};
 const logger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
@@ -282,4 +282,19 @@ test('ZaloClient normalizes voice/video attachments, undo events, and reaction m
   assert.equal(telegramReactionToZalo('👍'), '/-strong');
   assert.equal(telegramReactionToZalo('😢'), ':-((');
   assert.equal(telegramReactionToZalo(''), '');
+
+  const members = [
+    { uid: 'u100', name: 'Nguyễn Minh Hưng' },
+    { uid: 'u200', name: 'Trần Thu Hà' },
+  ];
+  const m1 = buildZaloMentions('Chào @all và @Hung nhé!', members);
+  assert.equal(m1.text, 'Chào @all và @Nguyễn Minh Hưng nhé!');
+  assert.deepEqual(m1.mentions, [
+    { pos: 5, len: 4, uid: '-1' },
+    { pos: 13, len: 17, uid: 'u100' },
+  ]);
+
+  const m2 = buildZaloMentions('@ kiểm tra giúp nhé', members, { uid: 'u200', name: 'Trần Thu Hà' });
+  assert.equal(m2.text, '@Trần Thu Hà kiểm tra giúp nhé');
+  assert.deepEqual(m2.mentions, [{ pos: 0, len: 12, uid: 'u200' }]);
 });

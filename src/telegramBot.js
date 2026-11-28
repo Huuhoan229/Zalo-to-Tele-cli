@@ -7,6 +7,7 @@ import { boundTelegramApi, BoundedTelegramContext, normalizedMenuText } from './
 import { TelegramGroupQueue, telegramRateLimitSeconds } from './telegramGroupQueue.js';
 import { getVietnamDateParts } from './evn.js';
 import { PRESET_VIETNAM_LOCATIONS } from './weather.js';
+import { buildZaloMentions } from './zaloClient.js';
 
 const runtimes = new Map();
 const MAX_TELEGRAM_DOWNLOAD_BYTES = 20 * 1024 * 1024;
@@ -204,9 +205,15 @@ function isTelegramDestinationError(error) {
 }
 
 function formatZaloMessage(zaloMessage) {
-  const prefix = zaloMessage.isGroup
+  const basePrefix = zaloMessage.isGroup
     ? `[${zaloMessage.senderName}]`
     : `[${zaloMessage.title || zaloMessage.senderName}]`;
+  const mentionBadge = zaloMessage.mentionsSelf
+    ? ' 🔔 [Đã tag bạn]'
+    : zaloMessage.mentionsAll
+      ? ' 📢 [@All]'
+      : '';
+  const prefix = `${basePrefix}${mentionBadge}`;
   const quoted = zaloMessage.replyTo?.text
     ? `↪ Trả lời ${zaloMessage.replyTo.senderName ? `[${zaloMessage.replyTo.senderName}]` : ''}: ${zaloMessage.replyTo.text}\n\n`
     : '';
@@ -1706,6 +1713,15 @@ class SharedTelegramRuntime {
       );
     });
 
+    this.bot.command(['tag', 'mention'], async (ctx) => {
+      if (!ctx.message?.message_thread_id) {
+        return ctx.reply('Dùng /tag trong topic nhóm Zalo để xem danh sách thành viên hoặc tag thành viên.');
+      }
+      const routed = this.findBridgeByTopic(ctx.message.message_thread_id, ctx.chat?.id);
+      if (!routed) return ctx.reply('Topic này chưa được map với cuộc trò chuyện Zalo nào.');
+      await routed.bridge.handleTelegramTag(ctx, routed.mapping);
+    });
+
     this.bot.on('message_reaction', async (ctx) => {
       const reactionUpdate = ctx.update?.message_reaction;
       if (!reactionUpdate) return;
@@ -2139,6 +2155,96 @@ export class TelegramBridgeBot {
     ));
   }
 
+  async resolveGroupMentions(mapping, rawText, replyMessageId = null) {
+    const text = String(rawText ?? '');
+    if (Number(mapping?.threadType) !== 1 || !text || !text.includes('@')) {
+      return { text, mentions: [] };
+    }
+    const fromHistory = this.store.listGroupParticipants?.(mapping.conversationId) || [];
+    const fromGroupApi = (await this.zalo.fetchGroupMembers?.(mapping.conversationId).catch(() => [])) || [];
+    const participants = [...fromHistory, ...fromGroupApi];
+
+    let repliedParticipant = null;
+    if (replyMessageId && typeof this.store.findMessageByTelegramId === 'function') {
+      const repliedEntry = this.store.findMessageByTelegramId(mapping.conversationId, replyMessageId);
+      const uid = String(repliedEntry?.replyData?.uidFrom || '').trim();
+      const name = String(repliedEntry?.senderName || '').trim();
+      if (uid && uid !== '0' && name && name !== 'Tôi' && name !== 'AI') {
+        repliedParticipant = { uid, name };
+      }
+    }
+
+    return buildZaloMentions(text, participants, repliedParticipant);
+  }
+
+  async handleTelegramTag(ctx, mapped = null) {
+    if (!isAllowed(this.config, ctx.from?.id)) {
+      return ctx.reply('Bạn chưa được cấp quyền gửi sang Zalo.');
+    }
+    const mapping = mapped || this.store.getByTopic?.(ctx.message?.message_thread_id);
+    if (!mapping) return ctx.reply('Topic này chưa được map với cuộc trò chuyện Zalo nào.');
+    if (Number(mapping.threadType) !== 1) {
+      return ctx.reply('Topic này là trò chuyện cá nhân 1-1 (chỉ dùng tag @ trong nhóm Zalo).');
+    }
+
+    const argText = String(ctx.message?.text || '').replace(/^\/(?:tag|mention)(?:@\w+)?\s*/i, '').trim();
+    const replyMsgId = ctx.message?.reply_to_message?.message_id || null;
+
+    if (!argText) {
+      const fromHistory = this.store.listGroupParticipants?.(mapping.conversationId) || [];
+      const fromGroupApi = (await this.zalo.fetchGroupMembers?.(mapping.conversationId).catch(() => [])) || [];
+      const seen = new Map();
+      for (const p of [...fromHistory, ...fromGroupApi]) {
+        if (p?.uid && p?.name && !seen.has(String(p.uid))) {
+          seen.set(String(p.uid), p.name);
+        }
+      }
+      const names = [...seen.values()];
+      const listLines = names.length
+        ? names.slice(0, 40).map((n) => `• @${n}`).join('\n')
+        : '(Chưa có thành viên nào trong bộ nhớ — hãy chờ tin nhắn từ nhóm hoặc thử gõ @all)';
+      return ctx.reply([
+        `🏷 Cách tag (@) thành viên trong nhóm Zalo “${mapping.title}”:`,
+        '1️⃣ Gõ trực tiếp trong tin nhắn: @all (hoặc @mọi người) để tag cả nhóm.',
+        '2️⃣ Gõ @Tên (hoặc @TênCuối không dấu) ngay trong tin nhắn, ví dụ: @Hưng ơi kiểm tra giúp.',
+        '3️⃣ Reply vào tin nhắn của người muốn tag rồi gõ: @ nội dung (hoặc /tag nội dung).',
+        '',
+        '👥 Các thành viên đã nhận diện trong nhóm:',
+        listLines,
+      ].join('\n'));
+    }
+
+    const rawToProcess = replyMsgId && !argText.includes('@') ? `@ ${argText}` : argText;
+    const quote = replyMsgId ? this.store.getReplyData(replyMsgId) : null;
+    const { text: finalText, mentions } = await this.resolveGroupMentions(mapping, rawToProcess, replyMsgId);
+
+    this.pendingEcho?.register?.(mapping.conversationId, finalText);
+    let sent;
+    try {
+      sent = await this.zalo.sendText({
+        conversationId: mapping.conversationId,
+        threadType: mapping.threadType,
+        text: finalText,
+        quote,
+        mentions,
+      });
+    } catch (error) {
+      this.pendingEcho?.consume?.(mapping.conversationId);
+      throw error;
+    }
+    await this.onTranscript?.(mapping, {
+      ...(sent?.msgId ? { id: String(sent.msgId) } : {}),
+      direction: 'out',
+      source: 'telegram',
+      senderName: telegramSenderName(ctx),
+      text: finalText,
+      attachment: null,
+      telegramMessageId: ctx.message?.message_id,
+      replyData: sent?.msgId ? { msgId: String(sent.msgId), ...(sent.cliMsgId ? { cliMsgId: String(sent.cliMsgId) } : {}) } : null,
+      threadType: mapping.threadType,
+    });
+  }
+
   async forwardTelegramText(ctx, mapped = null) {
     if (ctx.chat?.id !== this.config.telegramForumChatId) return;
     if (!ctx.message.message_thread_id) return;
@@ -2151,9 +2257,9 @@ export class TelegramBridgeBot {
 
     const mapping = mapped || this.store.getByTopic(ctx.message.message_thread_id);
     if (!mapping) return;
-    const quote = ctx.message.reply_to_message
-      ? this.store.getReplyData(ctx.message.reply_to_message.message_id)
-      : null;
+    const replyMsgId = ctx.message.reply_to_message?.message_id || null;
+    const quote = replyMsgId ? this.store.getReplyData(replyMsgId) : null;
+    const { text: finalText, mentions } = await this.resolveGroupMentions(mapping, ctx.message.text, replyMsgId);
 
     this.pendingEcho?.register?.(mapping.conversationId);
     let sent;
@@ -2161,8 +2267,9 @@ export class TelegramBridgeBot {
       sent = await this.zalo.sendText({
         conversationId: mapping.conversationId,
         threadType: mapping.threadType,
-        text: ctx.message.text,
+        text: finalText,
         quote,
+        ...(mentions.length > 0 ? { mentions } : {}),
       });
     } catch (error) {
       this.pendingEcho?.consume?.(mapping.conversationId);
@@ -2173,7 +2280,7 @@ export class TelegramBridgeBot {
       direction: 'out',
       source: 'telegram',
       senderName: telegramSenderName(ctx),
-      text: ctx.message.text,
+      text: finalText,
       attachment: null,
       telegramMessageId: ctx.message?.message_id,
       replyData: sent?.msgId ? { msgId: String(sent.msgId), ...(sent.cliMsgId ? { cliMsgId: String(sent.cliMsgId) } : {}) } : null,

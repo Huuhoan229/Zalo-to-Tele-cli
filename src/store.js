@@ -514,6 +514,19 @@ export class Store {
     return null;
   }
 
+  listGroupParticipants(conversationId) {
+    const items = this.state.messages[String(conversationId)] || [];
+    const seen = new Map();
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = items[index];
+      const uid = String(item.replyData?.uidFrom || '').trim();
+      const name = String(item.senderName || '').trim();
+      if (!uid || uid === '0' || !name || name === 'Tôi' || name === 'AI') continue;
+      if (!seen.has(uid)) seen.set(uid, { uid, name });
+    }
+    return [...seen.values()];
+  }
+
   findMessageByZaloId(conversationId, { msgId, cliMsgId } = {}) {
     const targetMsgId = msgId !== null && msgId !== undefined && String(msgId) !== '' ? String(msgId) : null;
     const targetCliId = cliMsgId !== null && cliMsgId !== undefined && String(cliMsgId) !== '' && String(cliMsgId) !== '0'

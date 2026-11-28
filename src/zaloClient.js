@@ -129,6 +129,137 @@ function quotedMessageText(quote) {
   return '';
 }
 
+function foldVietnamese(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'D')
+    .toLowerCase();
+}
+
+function escapeRegex(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Parses @all and @MemberName mentions in a text message for a Zalo group.
+ * Supports:
+ *  - @all, @All, @mọi người, @moinguoi -> uid: "-1" (tag all group members)
+ *  - bare "@" when replying to a message -> expands to "@<RepliedSenderName>"
+ *  - @<FullName> or @<GivenName> (with or without Vietnamese diacritics)
+ */
+export function buildZaloMentions(inputText, participants = [], repliedParticipant = null) {
+  let text = String(inputText ?? '');
+  if (!text || !text.includes('@')) return { text, mentions: [] };
+
+  // 1. Expand bare "@" (e.g. "@ kiểm tra giúp nhé") when replying to a group member
+  if (repliedParticipant?.uid && repliedParticipant?.name && String(repliedParticipant.uid) !== '0') {
+    text = text.replace(/(^|\s)@(?=\s|[,.!?:;]|$)/g, `$1@${repliedParticipant.name}`);
+  }
+
+  // Merge unique participants (repliedParticipant first)
+  const pool = [];
+  const seenUids = new Set();
+  const addCandidate = (p) => {
+    const uid = String(p?.uid || '').trim();
+    const name = String(p?.name || '').trim();
+    if (!uid || uid === '0' || !name || name === 'Tôi' || name === 'AI' || seenUids.has(uid)) return;
+    seenUids.add(uid);
+    const words = name.split(/\s+/).filter(Boolean);
+    const lastWord = words.at(-1) || '';
+    const lastTwoWords = words.length >= 2 ? words.slice(-2).join(' ') : '';
+    const aliases = [...new Set([name, lastTwoWords, lastWord].filter((a) => a && a.length >= 2))];
+    pool.push({ uid, name, aliases });
+  };
+  if (repliedParticipant) addCandidate(repliedParticipant);
+  for (const p of participants || []) addCandidate(p);
+
+  // 2. Replace shorthand @alias (including accent-insensitive) with full @DisplayName
+  const aliasEntries = [];
+  for (const member of pool) {
+    for (const alias of member.aliases) {
+      aliasEntries.push({
+        uid: member.uid,
+        fullName: member.name,
+        alias,
+        foldedAlias: foldVietnamese(alias),
+      });
+    }
+  }
+  aliasEntries.sort((a, b) => b.alias.length - a.alias.length);
+
+  // Scan "@" positions to expand shorthand aliases to canonical "@fullName"
+  let cursor = 0;
+  while (cursor < text.length) {
+    const atIdx = text.indexOf('@', cursor);
+    if (atIdx === -1) break;
+    if (atIdx > 0 && /[\p{L}\p{N}_]/u.test(text[atIdx - 1])) {
+      cursor = atIdx + 1;
+      continue;
+    }
+    const afterAt = text.slice(atIdx + 1);
+    const foldedAfter = foldVietnamese(afterAt);
+    if (/^(?:all|moi\s*nguoi)(?=$|[^\p{L}\p{N}_])/iu.test(foldedAfter)) {
+      cursor = atIdx + 4;
+      continue;
+    }
+    let matchedEntry = null;
+    for (const entry of aliasEntries) {
+      if (foldedAfter.startsWith(entry.foldedAlias)) {
+        const boundaryChar = afterAt[entry.alias.length] || '';
+        if (!boundaryChar || !/[\p{L}\p{N}_]/u.test(boundaryChar)) {
+          matchedEntry = entry;
+          break;
+        }
+      }
+    }
+    if (matchedEntry) {
+      const replacement = `@${matchedEntry.fullName}`;
+      text = text.slice(0, atIdx) + replacement + text.slice(atIdx + 1 + matchedEntry.alias.length);
+      cursor = atIdx + replacement.length;
+    } else {
+      cursor = atIdx + 1;
+    }
+  }
+
+  // 3. Collect exact { pos, len, uid } mentions on the final text
+  const mentions = [];
+  const occupied = [];
+  const isOverlapping = (start, end) => occupied.some(([s, e]) => start < e && end > s);
+
+  const allRegex = /(^|[^\p{L}\p{N}_])(@(?:all|mọi\s*người|moi\s*nguoi))(?=$|[^\p{L}\p{N}_])/giu;
+  let allMatch;
+  while ((allMatch = allRegex.exec(text)) !== null) {
+    const prefixLen = allMatch[1].length;
+    const token = allMatch[2];
+    const pos = allMatch.index + prefixLen;
+    const len = token.length;
+    if (!isOverlapping(pos, pos + len)) {
+      occupied.push([pos, pos + len]);
+      mentions.push({ pos, len, uid: '-1' });
+    }
+  }
+
+  const membersByNameLen = [...pool].sort((a, b) => b.name.length - a.name.length);
+  for (const member of membersByNameLen) {
+    const tagToken = `@${member.name}`;
+    const regex = new RegExp(`(^|[^\\p{L}\\p{N}_])(${escapeRegex(tagToken)})(?=$|[^\\p{L}\\p{N}_])`, 'giu');
+    let m;
+    while ((m = regex.exec(text)) !== null) {
+      const pos = m.index + m[1].length;
+      const len = m[2].length;
+      if (!isOverlapping(pos, pos + len)) {
+        occupied.push([pos, pos + len]);
+        mentions.push({ pos, len, uid: String(member.uid) });
+      }
+    }
+  }
+
+  mentions.sort((a, b) => a.pos - b.pos);
+  return { text, mentions };
+}
+
 export class ZaloClient extends EventEmitter {
   constructor({ credentialsFile, sessionStore = null, loginMode, selfListen = true, logger }) {
     super();
@@ -425,6 +556,11 @@ export class ZaloClient extends EventEmitter {
       message.isSelf ||
       (this.selfUserId && String(message.data?.uidFrom || message.uidFrom || '') === this.selfUserId),
     );
+    const rawMentions = Array.isArray(message.data?.mentions) ? message.data.mentions : [];
+    const mentionsSelf = Boolean(
+      this.selfUserId && rawMentions.some((item) => String(item?.uid) === String(this.selfUserId)),
+    );
+    const mentionsAll = rawMentions.some((item) => String(item?.uid) === '-1' || Number(item?.type) === 1);
 
     return {
       id: message.data?.msgId || message.messageId || `${message.threadId}-${Date.now()}`,
@@ -432,6 +568,8 @@ export class ZaloClient extends EventEmitter {
       threadType: message.type,
       isGroup,
       isSelf,
+      mentionsSelf,
+      mentionsAll,
       senderName: isSelf ? 'Tôi' : pickSenderName(message),
       title: await this.resolveConversationTitle(message, isGroup, isSelf),
       text: attachment?.type === 'sticker' ? '' : pickText(content),
@@ -473,6 +611,43 @@ export class ZaloClient extends EventEmitter {
     return pickConversationTitle(message, true);
   }
 
+  async fetchGroupMembers(groupId) {
+    if (!this.api?.getGroupInfo) return [];
+    const key = String(groupId || '');
+    if (!key) return [];
+    this.groupMembersCache ||= new Map();
+    const cached = this.groupMembersCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) return cached.members;
+
+    try {
+      const response = await this.api.getGroupInfo(key);
+      const group = response?.gridInfoMap?.[key];
+      const rawList = Array.isArray(group?.memVerList)
+        ? group.memVerList
+        : Array.isArray(group?.memberIds)
+          ? group.memberIds
+          : [];
+      const memberIds = [...new Set(rawList.map((item) => String(item || '').split('_')[0]).filter(Boolean))].slice(0, 50);
+      const members = [];
+      if (memberIds.length > 0 && typeof this.api.getUserInfo === 'function') {
+        const info = await this.api.getUserInfo(memberIds);
+        const profiles = info?.changed_profiles || info || {};
+        for (const uid of memberIds) {
+          const profile = profiles[uid] || profiles[`${uid}_0`];
+          const name = String(profile?.displayName || profile?.zaloName || '').trim();
+          if (name && uid !== String(this.selfUserId || '')) {
+            members.push({ uid: String(uid), name });
+          }
+        }
+      }
+      this.groupMembersCache.set(key, { members, expiresAt: Date.now() + 10 * 60 * 1000 });
+      return members;
+    } catch (error) {
+      this.logger?.debug?.({ error, groupId: key }, 'Could not fetch Zalo group members for mention lookup.');
+      return [];
+    }
+  }
+
   prepareQuote(quote) {
     if (!quote) return null;
     if (quote.content !== undefined && quote.msgType !== undefined) {
@@ -494,29 +669,37 @@ export class ZaloClient extends EventEmitter {
     };
   }
 
-  async sendText({ conversationId, threadType, text, quote = null }) {
+  async sendText({ conversationId, threadType, text, quote = null, mentions = null }) {
     if (!this.api) throw new Error('Zalo is not connected');
     const validQuote = this.prepareQuote(quote);
-    const response = await this.api.sendMessage({ msg: text, ...(validQuote ? { quote: validQuote } : {}) }, conversationId, threadType);
+    const validMentions = Array.isArray(mentions) && mentions.length > 0 ? mentions : null;
+    const response = await this.api.sendMessage({
+      msg: text,
+      ...(validQuote ? { quote: validQuote } : {}),
+      ...(validMentions ? { mentions: validMentions } : {}),
+    }, conversationId, threadType);
     return extractSentIds(response);
   }
 
-  async sendImage({ conversationId, threadType, filePath, caption, quote = null }) {
+  async sendImage({ conversationId, threadType, filePath, caption, quote = null, mentions = null }) {
     if (!this.api) throw new Error('Zalo is not connected');
     const validQuote = this.prepareQuote(quote);
+    const validMentions = Array.isArray(mentions) && mentions.length > 0 ? mentions : null;
     const payload = {
       msg: caption || '',
       attachments: [path.resolve(filePath)],
       ...(validQuote ? { quote: validQuote } : {}),
+      ...(validMentions ? { mentions: validMentions } : {}),
     };
     const response = await this.api.sendMessage(payload, conversationId, threadType);
     return extractSentIds(response);
   }
 
-  async sendFile({ conversationId, threadType, filePath, filename, caption, quote = null }) {
+  async sendFile({ conversationId, threadType, filePath, filename, caption, quote = null, mentions = null }) {
     if (!this.api) throw new Error('Zalo is not connected');
     const data = await fs.readFile(filePath);
     const validQuote = this.prepareQuote(quote);
+    const validMentions = Array.isArray(mentions) && mentions.length > 0 ? mentions : null;
     const response = await this.api.sendMessage({
       msg: caption || '',
       attachments: [{
@@ -525,6 +708,7 @@ export class ZaloClient extends EventEmitter {
         metadata: { totalSize: data.length },
       }],
       ...(validQuote ? { quote: validQuote } : {}),
+      ...(validMentions ? { mentions: validMentions } : {}),
     }, conversationId, threadType);
     return extractSentIds(response);
   }
