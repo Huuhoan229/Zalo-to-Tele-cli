@@ -439,6 +439,16 @@ export class ZaloClient extends EventEmitter {
         ? {
             senderName: message.data.quote.fromD || message.data.quote.dName || message.data.quote.senderName || '',
             text: quotedMessageText(message.data.quote),
+            msgId:
+              message.data.quote.globalMsgId !== undefined && message.data.quote.globalMsgId !== null
+                ? String(message.data.quote.globalMsgId)
+                : message.data.quote.msgId !== undefined && message.data.quote.msgId !== null
+                  ? String(message.data.quote.msgId)
+                  : null,
+            cliMsgId:
+              message.data.quote.cliMsgId !== undefined && message.data.quote.cliMsgId !== null
+                ? String(message.data.quote.cliMsgId)
+                : null,
           }
         : null,
       attachment,
@@ -463,18 +473,41 @@ export class ZaloClient extends EventEmitter {
     return pickConversationTitle(message, true);
   }
 
+  prepareQuote(quote) {
+    if (!quote) return null;
+    if (quote.content !== undefined && quote.msgType !== undefined) {
+      if ((quote.uidFrom === '0' || !quote.uidFrom) && this.selfUserId) {
+        return { ...quote, uidFrom: this.selfUserId };
+      }
+      return quote;
+    }
+    if (!quote.msgId) return quote;
+    const uidFrom = (!quote.uidFrom || quote.uidFrom === '0') && this.selfUserId ? this.selfUserId : (quote.uidFrom || '0');
+    return {
+      ...quote,
+      uidFrom,
+      content: String(quote.content ?? ''),
+      msgType: quote.msgType || 'webchat',
+      cliMsgId: String(quote.cliMsgId ?? quote.msgId),
+      ts: String(quote.ts ?? Date.now()),
+      ttl: quote.ttl ?? 0,
+    };
+  }
+
   async sendText({ conversationId, threadType, text, quote = null }) {
     if (!this.api) throw new Error('Zalo is not connected');
-    const response = await this.api.sendMessage({ msg: text, ...(quote ? { quote } : {}) }, conversationId, threadType);
+    const validQuote = this.prepareQuote(quote);
+    const response = await this.api.sendMessage({ msg: text, ...(validQuote ? { quote: validQuote } : {}) }, conversationId, threadType);
     return extractSentIds(response);
   }
 
   async sendImage({ conversationId, threadType, filePath, caption, quote = null }) {
     if (!this.api) throw new Error('Zalo is not connected');
+    const validQuote = this.prepareQuote(quote);
     const payload = {
       msg: caption || '',
       attachments: [path.resolve(filePath)],
-      ...(quote ? { quote } : {}),
+      ...(validQuote ? { quote: validQuote } : {}),
     };
     const response = await this.api.sendMessage(payload, conversationId, threadType);
     return extractSentIds(response);
@@ -483,6 +516,7 @@ export class ZaloClient extends EventEmitter {
   async sendFile({ conversationId, threadType, filePath, filename, caption, quote = null }) {
     if (!this.api) throw new Error('Zalo is not connected');
     const data = await fs.readFile(filePath);
+    const validQuote = this.prepareQuote(quote);
     const response = await this.api.sendMessage({
       msg: caption || '',
       attachments: [{
@@ -490,7 +524,7 @@ export class ZaloClient extends EventEmitter {
         filename: safeFilename(filename, path.basename(filePath)),
         metadata: { totalSize: data.length },
       }],
-      ...(quote ? { quote } : {}),
+      ...(validQuote ? { quote: validQuote } : {}),
     }, conversationId, threadType);
     return extractSentIds(response);
   }

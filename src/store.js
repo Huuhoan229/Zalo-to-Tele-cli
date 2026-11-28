@@ -480,7 +480,20 @@ export class Store {
     for (const items of Object.values(this.state.messages)) {
       for (let index = items.length - 1; index >= 0; index -= 1) {
         const item = items[index];
-        if (String(item.telegramMessageId ?? '') === target) return item.replyData || null;
+        if (String(item.telegramMessageId ?? '') === target) {
+          if (!item.replyData) return null;
+          if (item.replyData.content !== undefined) return item.replyData;
+          if (!item.replyData.msgId) return item.replyData;
+          return {
+            content: item.text ?? '',
+            msgType: item.replyData.msgType || 'webchat',
+            uidFrom: item.replyData.uidFrom || '0',
+            msgId: String(item.replyData.msgId),
+            cliMsgId: String(item.replyData.cliMsgId ?? item.replyData.msgId),
+            ts: String(item.replyData.ts ?? (Date.parse(item.createdAt) || Date.now())),
+            ttl: item.replyData.ttl ?? 0,
+          };
+        }
       }
     }
     return null;

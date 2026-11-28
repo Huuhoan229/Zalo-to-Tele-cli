@@ -2063,7 +2063,14 @@ export class TelegramBridgeBot {
     // Zalo -> Telegram: a rare duplicate in the topic is better than a lost
     // message, so allow one retry after an ambiguous timeout here.
     const send = (action) => this.runtime.groupQueue.run(chatId, action, this.forwardingAbort.signal, { retryAmbiguous: true });
-    const options = { message_thread_id: mapping.topicId };
+    const quotedEntry =
+      (zaloMessage.replyTo?.msgId || zaloMessage.replyTo?.cliMsgId) && typeof this.store?.findMessageByZaloId === 'function'
+        ? this.store.findMessageByZaloId(zaloMessage.conversationId, zaloMessage.replyTo)
+        : null;
+    const options = {
+      message_thread_id: mapping.topicId,
+      ...(quotedEntry?.telegramMessageId ? { reply_to_message_id: quotedEntry.telegramMessageId } : {}),
+    };
     const caption = formatZaloMessage(zaloMessage).slice(0, 1024);
     const sendAsText = (note = '') => send(() => this.bot.telegram.sendMessage(
       chatId,
