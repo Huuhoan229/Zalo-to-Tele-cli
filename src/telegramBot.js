@@ -2675,6 +2675,25 @@ export class TelegramBridgeBot {
     }));
   }
 
+  async resolveReactionSenderName(reactionEvent, mapping) {
+    if (reactionEvent?.isSelf) return 'Tôi';
+    const rawName = String(reactionEvent?.senderName || '').trim();
+    const uid = String(reactionEvent?.uidFrom || '').trim();
+    if (rawName && rawName !== 'Zalo' && rawName !== uid && !/^\d{8,}$/.test(rawName)) {
+      return rawName;
+    }
+    if (!reactionEvent?.isGroup && mapping?.title) {
+      return mapping.title;
+    }
+    if (uid) {
+      const fromHistory = this.store.listGroupParticipants?.(reactionEvent.conversationId)?.find((p) => String(p.uid) === uid);
+      if (fromHistory?.name) return fromHistory.name;
+      const fromApi = await this.zalo?.resolveUserName?.(uid, reactionEvent.conversationId);
+      if (fromApi) return fromApi;
+    }
+    return rawName || mapping?.title || 'Thành viên Zalo';
+  }
+
   async handleZaloReaction(reactionEvent) {
     if (!reactionEvent?.conversationId) return;
     const mapping = this.store.getByConversation?.(reactionEvent.conversationId);
@@ -2682,6 +2701,8 @@ export class TelegramBridgeBot {
     const emoji = zaloReactionToTelegram(reactionEvent.rIcon);
     const chatId = this.config.telegramForumChatId;
     const send = (action) => this.runtime.groupQueue.run(chatId, action, this.forwardingAbort.signal);
+    const reactorName = await this.resolveReactionSenderName(reactionEvent, mapping);
+    const reactorKey = String(reactionEvent.uidFrom || reactorName || 'zalo');
 
     for (const target of reactionEvent.targets || []) {
       const entry = this.store.findMessageByZaloId?.(reactionEvent.conversationId, target);
@@ -2699,6 +2720,52 @@ export class TelegramBridgeBot {
       })).catch((error) => {
         this.logger.warn({ error: humanError(error), messageId: entry.telegramMessageId }, 'Could not set Telegram message reaction.');
       });
+
+      entry.zaloReactions ||= {};
+      if (!emoji) {
+        delete entry.zaloReactions[reactorKey];
+      } else {
+        const current = entry.zaloReactions[reactorKey] || { name: reactorName, emojis: [] };
+        current.name = reactorName;
+        if (!current.emojis.includes(emoji)) {
+          current.emojis = [...current.emojis, emoji].slice(-8);
+        }
+        entry.zaloReactions[reactorKey] = current;
+      }
+
+      const activeReactors = Object.values(entry.zaloReactions).filter((r) => Array.isArray(r?.emojis) && r.emojis.length > 0);
+      if (activeReactors.length === 0) continue;
+
+      const summaryText = activeReactors.length === 1
+        ? `🎭 [${activeReactors[0].name}] đã bày tỏ cảm xúc: ${activeReactors[0].emojis.join(' ')}`
+        : [
+            '🎭 Cảm xúc trên Zalo:',
+            ...activeReactors.map((r) => `• ${r.name}: ${r.emojis.join(' ')}`),
+          ].join('\n');
+
+      if (entry.reactionNoticeMessageId && typeof this.bot.telegram.editMessageText === 'function') {
+        const edited = await send(() => this.bot.telegram.editMessageText(
+          chatId,
+          entry.reactionNoticeMessageId,
+          undefined,
+          summaryText,
+        )).then(() => true).catch(() => false);
+        if (edited) {
+          await this.store.save?.().catch(() => {});
+          continue;
+        }
+      }
+
+      if (typeof this.bot.telegram.sendMessage === 'function') {
+        const notice = await send(() => this.bot.telegram.sendMessage(chatId, summaryText, {
+          message_thread_id: mapping.topicId,
+          reply_to_message_id: entry.telegramMessageId,
+        })).catch(() => null);
+        if (notice?.message_id) {
+          entry.reactionNoticeMessageId = notice.message_id;
+          await this.store.save?.().catch(() => {});
+        }
+      }
     }
   }
 

@@ -610,12 +610,43 @@ export class ZaloClient extends EventEmitter {
       threadType: reaction?.isGroup ? ThreadType.Group : ThreadType.User,
       isGroup: Boolean(reaction?.isGroup),
       isSelf,
+      uidFrom: data.uidFrom !== undefined && data.uidFrom !== null ? String(data.uidFrom) : null,
       senderName: isSelf ? 'Tôi' : (data.dName || data.uidFrom || 'Zalo'),
       rIcon: typeof content.rIcon === 'string' ? content.rIcon : '',
       rType: content.rType,
       targets,
       raw: reaction,
     };
+  }
+
+  async resolveUserName(uid, conversationId = null) {
+    const cleanUid = String(uid || '').trim();
+    if (!cleanUid || cleanUid === '0') return null;
+    if (this.selfUserId && cleanUid === String(this.selfUserId)) return 'Tôi';
+    this.userNameCache ||= new Map();
+    if (this.userNameCache.has(cleanUid)) return this.userNameCache.get(cleanUid);
+    if (conversationId && this.groupMembersCache?.has(String(conversationId))) {
+      const found = this.groupMembersCache.get(String(conversationId))?.members?.find((m) => String(m.uid) === cleanUid);
+      if (found?.name) {
+        this.userNameCache.set(cleanUid, found.name);
+        return found.name;
+      }
+    }
+    if (typeof this.api?.getUserInfo === 'function') {
+      try {
+        const info = await this.api.getUserInfo([cleanUid]);
+        const profiles = info?.changed_profiles || info || {};
+        const profile = profiles[cleanUid] || profiles[`${cleanUid}_0`];
+        const name = String(profile?.displayName || profile?.zaloName || '').trim();
+        if (name) {
+          this.userNameCache.set(cleanUid, name);
+          return name;
+        }
+      } catch {
+        // Ignore lookup error
+      }
+    }
+    return null;
   }
 
   stop() {
